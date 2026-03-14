@@ -633,7 +633,8 @@ async def send_payment_info(message_target, config: Config) -> None:
         "payment",
         "ℹ ОПЛАТА УЧАСТИЯ\n\n"
         "Перевод участия:\n"
-        "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
+        "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917\n\n"
+        "Если оплатил, нажми кнопку ✅ Оплатил.",
     )
     qr_image = await asyncio.to_thread(
         make_qr_from_text,
