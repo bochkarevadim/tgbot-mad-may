@@ -55,6 +55,7 @@ MENU_RADIO = "📻 Радио Пустоши"
 MENU_LORE = "🌍 История мира MAD DAY"
 MENU_INFO = "ℹ Информация об игре"
 MENU_BRIEFING = "📘 Брифинг фракции"
+MENU_FACTION_CHAT = "💬 Чат фракции"
 MENU_STATS = "📊 Баланс фракций"
 PAYMENT_CONFIRMED_CALLBACK = "payment_confirmed"
 FACTION_CALLBACK_PREFIX = "faction:"
@@ -591,7 +592,7 @@ def build_main_menu() -> ReplyKeyboardMarkup:
             [MENU_MAP, MENU_SCHEDULE],
             [MENU_RADIO, MENU_LORE],
             [MENU_INFO, MENU_BRIEFING],
-            [MENU_STATS],
+            [MENU_FACTION_CHAT, MENU_STATS],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -1060,6 +1061,44 @@ async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(briefing_text, reply_markup=build_main_menu())
 
 
+async def faction_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sheet = get_sheet(context)
+    config = get_config(context)
+    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+
+    if not player:
+        await update.message.reply_text(
+            "Сначала зарегистрируйся через /start, чтобы получить доступ к чату фракции.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    faction = str(player.get("Фракция", "")).strip()
+    if not faction:
+        await update.message.reply_text(
+            "Не удалось определить фракцию. Обратись к организатору.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    chat_link = config.faction_chat_links.get(faction)
+    if not chat_link:
+        await update.message.reply_text(
+            "Чат этой фракции ещё не настроен.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    reply_markup = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("ЧАТ ФРАКЦИИ", url=chat_link)]]
+    )
+    await update.message.reply_text(
+        "Вот чат твоей фракции:",
+        reply_markup=reply_markup,
+    )
+    await send_main_menu(update.message)
+
+
 async def countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     config = get_config(context)
     game_start = parse_game_start(config.game_start_at, config.timezone_name)
@@ -1443,6 +1482,8 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await info(update, context)
     elif text == MENU_BRIEFING:
         await briefing(update, context)
+    elif text == MENU_FACTION_CHAT:
+        await faction_chat(update, context)
     elif text == MENU_STATS:
         await stats(update, context)
 
