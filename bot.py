@@ -508,7 +508,7 @@ def format_passport(player: dict) -> str:
             f"Фамилия имя: {player['full_name']}",
             f"Фракция: {player['faction']}",
             f"Тариф: {player['tariff']}",
-            f"Оплата: {payment_status}",
+            f"Статус оплаты: {payment_status}",
             "",
             "Статус: зарегистрирован",
         ]
@@ -1391,6 +1391,7 @@ def build_application(config: Config) -> Application:
             TARIFF: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_tariff)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True,
     )
 
     application.add_handler(registration)
