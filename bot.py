@@ -874,7 +874,12 @@ def format_registration_result(player: dict) -> str:
 
 
 def format_admin_registration_notice(player: dict, source: str) -> str:
-    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    source_labels = {
+        "telegram": "Telegram-бот",
+        "vk": "VK-бот",
+        "web": "Веб-форма",
+    }
+    source_label = source_labels.get(source, source)
     return "\n".join(
         [
             "🆕 Новая регистрация",
@@ -891,7 +896,12 @@ def format_admin_registration_notice(player: dict, source: str) -> str:
 
 
 def format_admin_payment_notice(player: dict, source: str, paid_at: str) -> str:
-    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    source_labels = {
+        "telegram": "Telegram-бот",
+        "vk": "VK-бот",
+        "web": "Веб-форма",
+    }
+    source_label = source_labels.get(source, source)
     return "\n".join(
         [
             "💸 Оплата отмечена",

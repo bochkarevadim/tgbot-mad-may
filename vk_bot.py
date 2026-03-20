@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import os
 import random
 import tempfile
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict
@@ -23,6 +26,7 @@ from bot import (
     RegistrationSheet,
     find_scenario_image_path,
     format_countdown,
+    format_admin_registration_notice,
     format_passport,
     format_registration_result,
     format_start_message,
@@ -35,6 +39,7 @@ from bot import (
     parse_faction_chat_links,
     parse_faction_limits,
     parse_game_start,
+    parse_admin_ids,
     parse_tariff_buttons,
     parse_tariffs,
     progress_bar,
@@ -87,6 +92,8 @@ SESSION_REREGISTER_CONFIRM = "reregister_confirm"
 class VkConfig:
     vk_token: str
     vk_group_id: int
+    telegram_token: str | None
+    admin_ids: set[int]
     spreadsheet_name: str
     spreadsheet_id: str | None
     credentials_file: str
@@ -106,6 +113,8 @@ def load_vk_config() -> VkConfig:
     load_dotenv()
     vk_token = os.getenv("VK_TOKEN", "").strip()
     vk_group_id_raw = os.getenv("VK_GROUP_ID", "").strip()
+    telegram_token = os.getenv("TOKEN", "").strip() or None
+    admin_ids = parse_admin_ids(os.getenv("ADMIN_IDS"))
     if not vk_token:
         raise RuntimeError("Environment variable VK_TOKEN is required.")
     if not vk_group_id_raw.isdigit():
@@ -142,6 +151,8 @@ def load_vk_config() -> VkConfig:
     return VkConfig(
         vk_token=vk_token,
         vk_group_id=int(vk_group_id_raw),
+        telegram_token=telegram_token,
+        admin_ids=admin_ids,
         spreadsheet_name=spreadsheet_name,
         spreadsheet_id=spreadsheet_id,
         credentials_file=credentials_file,
@@ -257,6 +268,34 @@ def send_message(vk, peer_id: int, text: str, keyboard: VkKeyboard | None = None
     )
     response = vk.messages.send(**params)
     logger.info("VK message sent successfully: peer_id=%s response=%s", peer_id, response)
+
+
+async def _notify_telegram_admins(config: VkConfig, text: str) -> None:
+    if not config.telegram_token or not config.admin_ids:
+        logger.info("Telegram admin notification skipped: TOKEN or ADMIN_IDS not configured.")
+        return
+
+    api_url = f"https://api.telegram.org/bot{config.telegram_token}/sendMessage"
+    for admin_id in sorted(config.admin_ids):
+        data = urllib.parse.urlencode(
+            {
+                "chat_id": admin_id,
+                "text": text,
+            }
+        ).encode("utf-8")
+        try:
+            with urllib.request.urlopen(api_url, data=data, timeout=15) as response:
+                response.read()
+            logger.info("Telegram admin notification sent: admin_id=%s", admin_id)
+        except Exception:
+            logger.exception("Failed to send Telegram admin notification: admin_id=%s", admin_id)
+
+
+def notify_telegram_admins(config: VkConfig, text: str) -> None:
+    try:
+        asyncio.run(_notify_telegram_admins(config, text))
+    except Exception:
+        logger.exception("Telegram admin notification task failed")
 
 
 def upload_photo(vk, path: str) -> str:
@@ -621,6 +660,10 @@ def main() -> None:
                     logger.info("Appending VK player to sheet: vk_id=%s id=%s", vk_user_id, player_id)
                     sheet.append_player(player)
                     logger.info("VK player saved to sheet successfully: vk_id=%s id=%s", vk_user_id, player_id)
+                    notify_telegram_admins(
+                        config,
+                        format_admin_registration_notice(player, "vk"),
+                    )
 
                     send_message(vk, peer_id, format_registration_result(player))
                     qr_image = make_qr_bytes(player_id)
