@@ -673,6 +673,52 @@ def format_registration_result(player: dict) -> str:
     )
 
 
+def format_admin_registration_notice(player: dict, source: str) -> str:
+    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    return "\n".join(
+        [
+            "🆕 Новая регистрация",
+            "",
+            f"Источник: {source_label}",
+            f"ID: {player['id']}",
+            f"Позывной: {player['name']}",
+            f"Имя: {player['full_name']}",
+            f"Телефон: {player['phone']}",
+            f"Фракция: {player['faction']}",
+            f"Тариф: {player['tariff']}",
+        ]
+    )
+
+
+def format_admin_payment_notice(player: dict, source: str, paid_at: str) -> str:
+    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    return "\n".join(
+        [
+            "💸 Оплата отмечена",
+            "",
+            f"Источник: {source_label}",
+            f"ID: {player['id']}",
+            f"Позывной: {player['name']}",
+            f"Имя: {player['full_name']}",
+            f"Фракция: {player['faction']}",
+            f"Тариф: {player['tariff']}",
+            f"Время оплаты: {paid_at}",
+        ]
+    )
+
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    config = get_config(context)
+    if not config.admin_ids:
+        return
+
+    for admin_id in sorted(config.admin_ids):
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as exc:
+            logger.warning("Failed to send admin notification to %s: %s", admin_id, exc)
+
+
 def parse_radio_messages() -> list[str]:
     raw = load_text_content(
         "radio",
@@ -872,6 +918,7 @@ async def get_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     }
 
     await asyncio.to_thread(sheet.append_player, player)
+    await notify_admins(context, format_admin_registration_notice(player, "telegram"))
     qr_image = await asyncio.to_thread(make_qr_bytes, player_id)
 
     await update.message.reply_text(
@@ -1191,6 +1238,21 @@ async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "✅ Оплата отмечена.\n\n"
         "Статус бойца обновлён в реестре MAD DAY.",
         reply_markup=build_main_menu(),
+    )
+    await notify_admins(
+        context,
+        format_admin_payment_notice(
+            {
+                "id": str(player.get("ID", "")).strip(),
+                "name": str(player.get("Позывной", "")).strip(),
+                "full_name": str(player.get("Фамилия Имя", "")).strip(),
+                "phone": str(player.get("Телефон", "")).strip(),
+                "faction": str(player.get("Фракция", "")).strip(),
+                "tariff": str(player.get("Тариф", "")).strip(),
+            },
+            "telegram",
+            paid_at,
+        ),
     )
 
 
