@@ -1119,11 +1119,12 @@ class DriveStorage:
         content: bytes,
         mime_type: str,
     ) -> dict:
+        if not getattr(self.config, "drive_receipts_folder_id", None):
+            raise RuntimeError("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID is not configured.")
         file_metadata = {
             "name": self.make_receipt_filename(player_id, source, original_name),
         }
-        if getattr(self.config, "drive_receipts_folder_id", None):
-            file_metadata["parents"] = [self.config.drive_receipts_folder_id]
+        file_metadata["parents"] = [self.config.drive_receipts_folder_id]
 
         media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
         created = (
@@ -1927,20 +1928,30 @@ async def handle_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TY
 
     uploaded_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
     player_id = str(player.get("ID", "")).strip()
-    upload_result = await asyncio.to_thread(
-        storage.upload_receipt,
-        player_id,
-        "telegram",
-        filename,
-        content,
-        mime_type,
-    )
-    await asyncio.to_thread(
-        sheet.record_receipt_upload,
-        player_id,
-        upload_result["link"],
-        uploaded_at,
-    )
+    try:
+        upload_result = await asyncio.to_thread(
+            storage.upload_receipt,
+            player_id,
+            "telegram",
+            filename,
+            content,
+            mime_type,
+        )
+        await asyncio.to_thread(
+            sheet.record_receipt_upload,
+            player_id,
+            upload_result["link"],
+            uploaded_at,
+        )
+    except Exception as exc:
+        logger.exception("Failed to upload Telegram receipt for player_id=%s: %s", player_id, exc)
+        await update.message.reply_text(
+            "Не удалось сохранить чек.\n\n"
+            "Скорее всего, ещё не настроена папка Google Drive для чеков.\n"
+            "Добавь GOOGLE_DRIVE_RECEIPTS_FOLDER_ID в Render и попробуй ещё раз.",
+            reply_markup=build_main_menu(),
+        )
+        return
     context.user_data.pop(RECEIPT_UPLOAD_PENDING_KEY, None)
     refreshed_player = await asyncio.to_thread(sheet.player_by_id, player_id) or player
 

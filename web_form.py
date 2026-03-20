@@ -684,7 +684,9 @@ class WebFormHandler(BaseHTTPRequestHandler):
             self._send_html(
                 _render_register_page(
                     receipt_values={"player_id": player_id, "phone": values.get("phone", "")},
-                    receipt_errors=["Не удалось загрузить чек. Попробуй позже."],
+                    receipt_errors=[
+                        "Не удалось загрузить чек. Скорее всего, ещё не настроена папка Google Drive для чеков.",
+                    ],
                 ),
                 status=500,
             )

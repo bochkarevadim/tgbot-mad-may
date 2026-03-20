@@ -789,14 +789,26 @@ def main() -> None:
 
                     uploaded_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
                     player_id = str(player.get("ID", "")).strip()
-                    upload_result = receipt_storage.upload_receipt(
-                        player_id,
-                        "vk",
-                        filename,
-                        content,
-                        mime_type,
-                    )
-                    sheet.record_receipt_upload(player_id, upload_result["link"], uploaded_at)
+                    try:
+                        upload_result = receipt_storage.upload_receipt(
+                            player_id,
+                            "vk",
+                            filename,
+                            content,
+                            mime_type,
+                        )
+                        sheet.record_receipt_upload(player_id, upload_result["link"], uploaded_at)
+                    except Exception:
+                        logger.exception("Failed to upload VK receipt for player_id=%s", player_id)
+                        send_message(
+                            vk,
+                            peer_id,
+                            "Не удалось сохранить чек.\n\n"
+                            "Скорее всего, ещё не настроена папка Google Drive для чеков.\n"
+                            "Добавь GOOGLE_DRIVE_RECEIPTS_FOLDER_ID в Render и попробуй ещё раз.",
+                            keyboard=build_user_menu(sheet, vk_user_id),
+                        )
+                        continue
                     refreshed_player = sheet.player_by_id(player_id) or player
                     notify_telegram_admins(
                         config,
