@@ -67,6 +67,7 @@ CANCEL_BUTTON = "Отмена"
 START_ALIASES = {
     "/start",
     "start",
+    "старт",
     "начать",
     "начать регистрацию",
     START_REGISTRATION_BUTTON.lower(),
@@ -273,17 +274,18 @@ def handle_menu_command(
     text: str,
 ) -> None:
     text_lower = text.lower().strip()
+    normalized_text = text_lower.rstrip(".!? ")
 
-    if text_lower in START_ALIASES:
+    if normalized_text in START_ALIASES:
         keyboard = build_keyboard([[START_REGISTRATION_BUTTON]], one_time=True)
         send_message(vk, peer_id, format_start_message(), keyboard=keyboard)
         return
 
-    if text_lower in {"/menu", "меню"}:
+    if normalized_text in {"/menu", "меню"}:
         send_main_menu(vk, sheet, peer_id, vk_user_id)
         return
 
-    if text_lower == "/help":
+    if normalized_text == "/help":
         send_message(
             vk,
             peer_id,
@@ -292,15 +294,15 @@ def handle_menu_command(
         )
         return
 
-    if text_lower in {"/ping", MENU_PING.lower()}:
+    if normalized_text in {"/ping", MENU_PING.lower()}:
         send_message(vk, peer_id, "OK", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/myid", MENU_MYID.lower()}:
+    if normalized_text in {"/myid", MENU_MYID.lower()}:
         send_message(vk, peer_id, f"Твой VK ID: {vk_user_id}", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/me", MENU_PROFILE.lower()}:
+    if normalized_text in {"/me", MENU_PROFILE.lower()}:
         player = sheet.player_by_vk_id(vk_user_id)
         if not player:
             send_message(vk, peer_id, "Ты ещё не зарегистрирован. Напиши /start.", keyboard=build_main_menu(False))
@@ -319,7 +321,7 @@ def handle_menu_command(
         send_message(vk, peer_id, f"QR-код бойца {normalized['id']}", attachment=attachment)
         return
 
-    if text_lower in {"/stats", MENU_STATS.lower()}:
+    if normalized_text in {"/stats", MENU_STATS.lower()}:
         counts = sheet.faction_counts()
         lines = ["⚔ Баланс сил", ""]
         for faction, limit in config.faction_limits.items():
@@ -330,12 +332,12 @@ def handle_menu_command(
         send_message(vk, peer_id, "\n".join(lines).strip(), keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/lore", MENU_LORE.lower()}:
+    if normalized_text in {"/lore", MENU_LORE.lower()}:
         text = load_text_content("lore", "После энергетического коллапса нефть стала единственной валютой.")
         send_message(vk, peer_id, text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/schedule", MENU_SCHEDULE.lower()}:
+    if normalized_text in {"/schedule", MENU_SCHEDULE.lower()}:
         text = load_text_content(
             "schedule",
             "MAD DAY\n\n10:00 — регистрация\n11:00 — сценарий 1\n13:00 — сценарий 2\n15:00 — финальная битва",
@@ -343,12 +345,12 @@ def handle_menu_command(
         send_message(vk, peer_id, text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/info", MENU_INFO.lower()}:
+    if normalized_text in {"/info", MENU_INFO.lower()}:
         text = load_text_content("info", "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 5.0")
         send_message(vk, peer_id, text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/briefing", MENU_BRIEFING.lower()}:
+    if normalized_text in {"/briefing", MENU_BRIEFING.lower()}:
         player = sheet.player_by_vk_id(vk_user_id)
         if not player:
             send_message(vk, peer_id, "Сначала зарегистрируйся через /start, чтобы получить брифинг.", keyboard=build_main_menu(False))
@@ -359,7 +361,7 @@ def handle_menu_command(
         send_message(vk, peer_id, briefing_text, keyboard=build_main_menu(True))
         return
 
-    if text_lower in {MENU_FACTION_CHAT.lower(), "/faction_chat"}:
+    if normalized_text in {MENU_FACTION_CHAT.lower(), "/faction_chat"}:
         player = sheet.player_by_vk_id(vk_user_id)
         if not player:
             send_message(
@@ -383,7 +385,7 @@ def handle_menu_command(
         send_main_menu(vk, sheet, peer_id, vk_user_id)
         return
 
-    if text_lower in {"/radio", MENU_RADIO.lower()}:
+    if normalized_text in {"/radio", MENU_RADIO.lower()}:
         raw = load_text_content(
             "radio",
             "Радиоперехват...\n\nКомандование вызывает тебя.\nПроверь снаряжение перед выходом.",
@@ -392,7 +394,7 @@ def handle_menu_command(
         send_message(vk, peer_id, random.choice(messages), keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower in {"/countdown", MENU_COUNTDOWN.lower()}:
+    if normalized_text in {"/countdown", MENU_COUNTDOWN.lower()}:
         game_start = parse_game_start(config.game_start_at, config.timezone_name)
         if not game_start:
             send_message(vk, peer_id, "Дата старта игры ещё не настроена.", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
@@ -400,7 +402,7 @@ def handle_menu_command(
         send_message(vk, peer_id, format_countdown(game_start, config.timezone_name), keyboard=build_main_menu(True))
         return
 
-    if text_lower in {"/map", MENU_MAP.lower()}:
+    if normalized_text in {"/map", MENU_MAP.lower()}:
         send_message(vk, peer_id, "🗺 Карты полигона по миссиям:", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         for key, title in [("scenario1", "🗺 Эпизод 1"), ("scenario2", "🗺 Эпизод 2"), ("scenario3", "🗺 Эпизод 3")]:
             image_path = find_scenario_image_path(key)
@@ -413,8 +415,8 @@ def handle_menu_command(
                 send_message(vk, peer_id, caption)
         return
 
-    if text_lower in {"/scenario1", "/scenario2", "/scenario3"}:
-        scenario_key = text_lower.lstrip("/")
+    if normalized_text in {"/scenario1", "/scenario2", "/scenario3"}:
+        scenario_key = normalized_text.lstrip("/")
         scenario_text = load_text_content(scenario_key, "Сценарий пока не заполнен.")
         image_path = find_scenario_image_path(scenario_key)
         if image_path:
@@ -424,7 +426,7 @@ def handle_menu_command(
             send_message(vk, peer_id, scenario_text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if text_lower == PAYMENT_BUTTON.lower():
+    if normalized_text == PAYMENT_BUTTON.lower():
         player = sheet.player_by_vk_id(vk_user_id)
         if not player:
             send_message(vk, peer_id, "Сначала зарегистрируйся через /start, затем подтверди оплату.", keyboard=build_main_menu(False))
@@ -575,7 +577,8 @@ def main() -> None:
                 send_main_menu(vk, sheet, peer_id, vk_user_id)
                 continue
 
-        if text.lower() in START_ALIASES:
+        normalized_input = text.lower().strip().rstrip(".!? ")
+        if normalized_input in START_ALIASES:
             sessions[vk_user_id] = {"state": SESSION_CALLSIGN, "data": {}}
             send_message(vk, peer_id, "Введи позывной бойца:", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
             continue
