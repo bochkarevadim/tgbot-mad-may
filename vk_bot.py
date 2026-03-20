@@ -27,6 +27,7 @@ from bot import (
     find_scenario_image_path,
     format_countdown,
     format_admin_registration_notice,
+    format_admin_payment_notice,
     format_passport,
     format_registration_result,
     format_start_message,
@@ -544,6 +545,21 @@ def handle_menu_command(
             return
         paid_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
         if sheet.mark_paid("vk", vk_user_id, paid_at):
+            notify_telegram_admins(
+                config,
+                format_admin_payment_notice(
+                    {
+                        "id": str(player.get("ID", "")).strip(),
+                        "name": str(player.get("Позывной", "")).strip(),
+                        "full_name": str(player.get("Фамилия Имя", "")).strip(),
+                        "phone": str(player.get("Телефон", "")).strip(),
+                        "faction": str(player.get("Фракция", "")).strip(),
+                        "tariff": str(player.get("Тариф", "")).strip(),
+                    },
+                    "vk",
+                    paid_at,
+                ),
+            )
             send_message(vk, peer_id, "✅ Оплата отмечена.\n\nСтатус бойца обновлён в реестре MAD DAY.", keyboard=build_user_menu(sheet, vk_user_id))
         else:
             send_message(vk, peer_id, "Не удалось обновить оплату. Попробуй ещё раз позже.", keyboard=build_user_menu(sheet, vk_user_id))
