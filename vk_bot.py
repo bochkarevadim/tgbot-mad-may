@@ -156,9 +156,8 @@ def load_vk_config() -> VkConfig:
 def build_keyboard(rows: list[list[str]], one_time: bool = False) -> VkKeyboard:
     keyboard = VkKeyboard(one_time=one_time, inline=False)
     for row_index, row in enumerate(rows):
-        for button_index, label in enumerate(row):
-            color = VkKeyboardColor.PRIMARY if button_index == 0 else VkKeyboardColor.SECONDARY
-            keyboard.add_button(label, color=color)
+        for label in row:
+            keyboard.add_button(label, color=VkKeyboardColor.PRIMARY)
         if row_index != len(rows) - 1:
             keyboard.add_line()
     return keyboard
@@ -170,8 +169,10 @@ def build_main_menu(is_registered: bool) -> VkKeyboard:
         [MENU_MAP, MENU_SCHEDULE],
         [MENU_RADIO, MENU_LORE],
         [MENU_INFO, MENU_BRIEFING],
-        [MENU_FACTION_CHAT, MENU_STATS],
+        [MENU_STATS],
     ]
+    if is_registered:
+        rows.insert(4, [MENU_FACTION_CHAT])
     if not is_registered:
         rows.insert(0, [MENU_REGISTER])
     return build_keyboard(rows, one_time=False)
