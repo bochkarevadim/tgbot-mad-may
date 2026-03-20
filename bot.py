@@ -57,6 +57,9 @@ MENU_INFO = "ℹ Информация об игре"
 MENU_BRIEFING = "📘 Брифинг фракции"
 MENU_FACTION_CHAT = "💬 Чат фракции"
 MENU_STATS = "📊 Баланс фракций"
+MENU_REREGISTER = "♻ Перерегистрация"
+REREGISTER_CONFIRM_BUTTON = "✅ Подтвердить перерегистрацию"
+REREGISTER_CANCEL_BUTTON = "↩ Отмена"
 PAYMENT_CONFIRMED_CALLBACK = "payment_confirmed"
 FACTION_CALLBACK_PREFIX = "faction:"
 FACTION_BUTTONS = {
@@ -598,6 +601,23 @@ class RegistrationSheet:
     def player_by_vk_id(self, vk_id: int) -> dict | None:
         return self.player_by_platform_id("vk", vk_id)
 
+    def delete_player_by_platform_id(self, platform: str, platform_id: int) -> int:
+        platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
+        platform_index = SHEET_HEADERS.index(platform_key)
+        platform_id_str = str(platform_id)
+        rows = self.worksheet.get_all_values()
+        matched_rows: list[int] = []
+
+        for row_index in range(2, len(rows) + 1):
+            row = rows[row_index - 1]
+            if len(row) > platform_index and row[platform_index].strip() == platform_id_str:
+                matched_rows.append(row_index)
+
+        for row_index in reversed(matched_rows):
+            self.worksheet.delete_rows(row_index)
+
+        return len(matched_rows)
+
     def latest_players(self, limit: int = 30) -> list[dict]:
         records = self.all_records()
         return records[-limit:]
@@ -761,10 +781,22 @@ def build_main_menu() -> ReplyKeyboardMarkup:
             [MENU_RADIO, MENU_LORE],
             [MENU_INFO, MENU_BRIEFING],
             [MENU_FACTION_CHAT, MENU_STATS],
+            [MENU_REREGISTER],
         ],
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Выбери действие терминала",
+    )
+
+
+def build_reregister_confirmation_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [REREGISTER_CONFIRM_BUTTON],
+            [REREGISTER_CANCEL_BUTTON],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
@@ -1376,6 +1408,49 @@ async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(f"Твой Telegram ID: {user.id}", reply_markup=build_main_menu())
 
 
+async def request_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sheet = get_sheet(context)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
+    if not player:
+        await update.message.reply_text(
+            "Сначала зарегистрируйся, а потом уже можно будет перерегистрироваться.",
+            reply_markup=build_main_menu(),
+        )
+        return
+    await update.message.reply_text(
+        "♻ Перерегистрация удалит твою текущую запись и запустит регистрацию заново.\n\nПодтвердить?",
+        reply_markup=build_reregister_confirmation_menu(),
+    )
+
+
+async def confirm_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sheet = get_sheet(context)
+    removed = await asyncio.to_thread(
+        sheet.delete_player_by_platform_id,
+        "telegram",
+        update.effective_chat.id,
+    )
+    context.user_data.clear()
+    if not removed:
+        await update.message.reply_text(
+            "Текущая запись не найдена. Начинаем обычную регистрацию.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text(
+            "♻ Старая регистрация удалена. Начинаем заново.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    return await start(update, context)
+
+
+async def cancel_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Перерегистрация отменена.",
+        reply_markup=build_main_menu(),
+    )
+
+
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = load_text_content(
         "info",
@@ -1717,6 +1792,12 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
         await me(update, context)
     elif text == MENU_REGISTER:
         await start(update, context)
+    elif text == MENU_REREGISTER:
+        await request_reregister(update, context)
+    elif text == REREGISTER_CONFIRM_BUTTON:
+        await confirm_reregister(update, context)
+    elif text == REREGISTER_CANCEL_BUTTON:
+        await cancel_reregister(update, context)
     elif text == MENU_MAP:
         await send_map(update, context)
     elif text == MENU_SCHEDULE:

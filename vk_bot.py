@@ -58,9 +58,11 @@ MENU_INFO = "ℹ Информация об игре"
 MENU_BRIEFING = "📘 Брифинг фракции"
 MENU_FACTION_CHAT = "💬 Чат фракции"
 MENU_STATS = "📊 Баланс фракций"
+MENU_REREGISTER = "♻ Перерегистрация"
 START_REGISTRATION_BUTTON = "⚔ Начать регистрацию"
 PAYMENT_BUTTON = "✅ Оплатил"
 CANCEL_BUTTON = "Отмена"
+REREGISTER_CONFIRM_BUTTON = "✅ Подтвердить перерегистрацию"
 INTRO_ALIASES = {
     "/start",
     "start",
@@ -78,6 +80,7 @@ SESSION_PHONE = "phone"
 SESSION_FACTION = "faction"
 SESSION_FULL_NAME = "full_name"
 SESSION_TARIFF = "tariff"
+SESSION_REREGISTER_CONFIRM = "reregister_confirm"
 
 
 @dataclass
@@ -175,6 +178,7 @@ def build_main_menu(is_registered: bool, payment_pending: bool = False) -> VkKey
     ]
     if is_registered:
         rows.insert(4, [MENU_FACTION_CHAT])
+        rows.append([MENU_REREGISTER])
         if payment_pending:
             rows.append([PAYMENT_BUTTON])
     if not is_registered:
@@ -207,6 +211,31 @@ def build_open_link_keyboard(label: str, link: str) -> VkKeyboard:
     keyboard = VkKeyboard(one_time=False, inline=False)
     keyboard.add_openlink_button(label=label, link=link)
     return keyboard
+
+
+def build_reregister_confirmation_keyboard() -> VkKeyboard:
+    return build_keyboard(
+        [[REREGISTER_CONFIRM_BUTTON], [CANCEL_BUTTON]],
+        one_time=True,
+    )
+
+
+def normalize_command_text(text: str) -> str:
+    return text.lower().strip().rstrip(".!? ")
+
+
+def is_intro_command(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if normalized in INTRO_ALIASES:
+        return True
+    return "регистрац" in normalized or normalized in {"go", "стартуй"}
+
+
+def is_registration_trigger(text: str) -> bool:
+    normalized = normalize_command_text(text)
+    if normalized in REGISTRATION_TRIGGER_ALIASES:
+        return True
+    return "начать регистрац" in normalized
 
 
 def send_message(vk, peer_id: int, text: str, keyboard: VkKeyboard | None = None, attachment: str | None = None) -> None:
@@ -288,10 +317,9 @@ def handle_menu_command(
     vk_user_id: int,
     text: str,
 ) -> None:
-    text_lower = text.lower().strip()
-    normalized_text = text_lower.rstrip(".!? ")
+    normalized_text = normalize_command_text(text)
 
-    if normalized_text in INTRO_ALIASES:
+    if is_intro_command(text):
         if is_registered(sheet, vk_user_id):
             send_message(
                 vk,
@@ -406,6 +434,24 @@ def handle_menu_command(
             keyboard=build_open_link_keyboard("ЧАТ ФРАКЦИИ", chat_link),
         )
         send_main_menu(vk, sheet, peer_id, vk_user_id)
+        return
+
+    if normalized_text in {MENU_REREGISTER.lower(), "/reregister"}:
+        player = sheet.player_by_vk_id(vk_user_id)
+        if not player:
+            send_message(
+                vk,
+                peer_id,
+                "Сначала зарегистрируйся, а потом уже можно будет перерегистрироваться.",
+                keyboard=build_main_menu(False),
+            )
+            return
+        send_message(
+            vk,
+            peer_id,
+            "♻ Перерегистрация удалит твою текущую запись и запустит регистрацию заново.\n\nПодтвердить?",
+            keyboard=build_reregister_confirmation_keyboard(),
+        )
         return
 
     if normalized_text in {"/radio", MENU_RADIO.lower()}:
@@ -603,8 +649,27 @@ def main() -> None:
                     send_main_menu(vk, sheet, peer_id, vk_user_id)
                     continue
 
-            normalized_input = text.lower().strip().rstrip(".!? ")
-            if normalized_input in REGISTRATION_TRIGGER_ALIASES:
+                if state == SESSION_REREGISTER_CONFIRM:
+                    if normalize_command_text(text) == normalize_command_text(REREGISTER_CONFIRM_BUTTON):
+                        removed = sheet.delete_player_by_platform_id("vk", vk_user_id)
+                        sessions.pop(vk_user_id, None)
+                        if removed:
+                            send_message(vk, peer_id, "♻ Старая регистрация удалена.")
+                        else:
+                            send_message(vk, peer_id, "Старая запись не найдена, начинаем заново.")
+                        keyboard = build_keyboard([[START_REGISTRATION_BUTTON]], one_time=True)
+                        send_message(vk, peer_id, format_start_message(), keyboard=keyboard)
+                        continue
+
+                    send_message(
+                        vk,
+                        peer_id,
+                        "Подтверди перерегистрацию кнопкой ниже или нажми Отмена.",
+                        keyboard=build_reregister_confirmation_keyboard(),
+                    )
+                    continue
+
+            if is_registration_trigger(text):
                 if is_registered(sheet, vk_user_id):
                     send_message(
                         vk,
@@ -616,6 +681,17 @@ def main() -> None:
                 sessions[vk_user_id] = {"state": SESSION_CALLSIGN, "data": {}}
                 send_message(vk, peer_id, "Введи позывной бойца:", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
                 continue
+
+            if normalize_command_text(text) in {MENU_REREGISTER.lower(), "/reregister"}:
+                if is_registered(sheet, vk_user_id):
+                    sessions[vk_user_id] = {"state": SESSION_REREGISTER_CONFIRM, "data": {}}
+                    send_message(
+                        vk,
+                        peer_id,
+                        "♻ Перерегистрация удалит твою текущую запись и запустит регистрацию заново.\n\nПодтвердить?",
+                        keyboard=build_reregister_confirmation_keyboard(),
+                    )
+                    continue
 
             handle_menu_command(vk, sheet, config, peer_id, vk_user_id, text)
         except Exception:
