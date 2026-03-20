@@ -165,7 +165,7 @@ def build_keyboard(rows: list[list[str]], one_time: bool = False) -> VkKeyboard:
     return keyboard
 
 
-def build_main_menu(is_registered: bool) -> VkKeyboard:
+def build_main_menu(is_registered: bool, payment_pending: bool = False) -> VkKeyboard:
     rows = [
         [MENU_PROFILE],
         [MENU_MAP, MENU_SCHEDULE],
@@ -175,9 +175,19 @@ def build_main_menu(is_registered: bool) -> VkKeyboard:
     ]
     if is_registered:
         rows.insert(4, [MENU_FACTION_CHAT])
+        if payment_pending:
+            rows.append([PAYMENT_BUTTON])
     if not is_registered:
         rows.insert(0, [MENU_REGISTER])
     return build_keyboard(rows, one_time=False)
+
+
+def build_user_menu(sheet: RegistrationSheet, vk_user_id: int) -> VkKeyboard:
+    player = sheet.player_by_vk_id(vk_user_id)
+    if not player:
+        return build_main_menu(False)
+    payment_pending = str(player.get("Оплата", "")).strip().lower() != "оплачено"
+    return build_main_menu(True, payment_pending=payment_pending)
 
 
 def build_faction_keyboard() -> VkKeyboard:
@@ -238,8 +248,7 @@ def is_registered(sheet: RegistrationSheet, vk_user_id: int) -> bool:
 
 
 def send_main_menu(vk, sheet: RegistrationSheet, peer_id: int, vk_user_id: int) -> None:
-    registered = is_registered(sheet, vk_user_id)
-    keyboard = build_main_menu(registered)
+    keyboard = build_user_menu(sheet, vk_user_id)
     send_message(
         vk,
         peer_id,
@@ -296,16 +305,16 @@ def handle_menu_command(
             vk,
             peer_id,
             format_help_message(),
-            keyboard=build_main_menu(is_registered(sheet, vk_user_id)),
+            keyboard=build_user_menu(sheet, vk_user_id),
         )
         return
 
     if normalized_text == "/ping":
-        send_message(vk, peer_id, "OK", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, "OK", keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text == "/myid":
-        send_message(vk, peer_id, f"Твой VK ID: {vk_user_id}", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, f"Твой VK ID: {vk_user_id}", keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {"/me", MENU_PROFILE.lower()}:
@@ -321,7 +330,7 @@ def handle_menu_command(
             "tariff": str(player.get("Тариф", "")).strip(),
             "payment_status": str(player.get("Оплата", "")).strip(),
         }
-        send_message(vk, peer_id, format_passport(normalized), keyboard=build_main_menu(True))
+        send_message(vk, peer_id, format_passport(normalized), keyboard=build_user_menu(sheet, vk_user_id))
         qr_image = make_qr_bytes(normalized["id"])
         attachment = upload_photo_from_bytes(vk, qr_image)
         send_message(vk, peer_id, f"QR-код бойца {normalized['id']}", attachment=attachment)
@@ -335,12 +344,12 @@ def handle_menu_command(
             lines.append(faction)
             lines.append(f"{progress_bar(current, limit)} {current}/{limit}")
             lines.append("")
-        send_message(vk, peer_id, "\n".join(lines).strip(), keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, "\n".join(lines).strip(), keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {"/lore", MENU_LORE.lower()}:
         text = load_text_content("lore", "После энергетического коллапса нефть стала единственной валютой.")
-        send_message(vk, peer_id, text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, text, keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {"/schedule", MENU_SCHEDULE.lower()}:
@@ -348,12 +357,12 @@ def handle_menu_command(
             "schedule",
             "MAD DAY\n\n10:00 — регистрация\n11:00 — сценарий 1\n13:00 — сценарий 2\n15:00 — финальная битва",
         )
-        send_message(vk, peer_id, text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, text, keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {"/info", MENU_INFO.lower()}:
         text = load_text_content("info", "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 5.0")
-        send_message(vk, peer_id, text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, text, keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {"/briefing", MENU_BRIEFING.lower()}:
@@ -364,7 +373,7 @@ def handle_menu_command(
         faction = str(player.get("Фракция", "")).strip()
         briefing_key = "briefing_steel" if "Корпус" in faction else "briefing_state"
         briefing_text = load_text_content(briefing_key, "Брифинг пока не заполнен.")
-        send_message(vk, peer_id, briefing_text, keyboard=build_main_menu(True))
+        send_message(vk, peer_id, briefing_text, keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {MENU_FACTION_CHAT.lower(), "/faction_chat"}:
@@ -380,7 +389,7 @@ def handle_menu_command(
         faction = str(player.get("Фракция", "")).strip()
         chat_link = config.faction_chat_links.get(faction)
         if not chat_link:
-            send_message(vk, peer_id, "Чат этой фракции ещё не настроен.", keyboard=build_main_menu(True))
+            send_message(vk, peer_id, "Чат этой фракции ещё не настроен.", keyboard=build_user_menu(sheet, vk_user_id))
             return
         send_message(
             vk,
@@ -397,19 +406,19 @@ def handle_menu_command(
             "Радиоперехват...\n\nКомандование вызывает тебя.\nПроверь снаряжение перед выходом.",
         )
         messages = [part.strip() for part in raw.split("\n\n---\n\n") if part.strip()] or [raw]
-        send_message(vk, peer_id, random.choice(messages), keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, random.choice(messages), keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text == "/countdown":
         game_start = parse_game_start(config.game_start_at, config.timezone_name)
         if not game_start:
-            send_message(vk, peer_id, "Дата старта игры ещё не настроена.", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+            send_message(vk, peer_id, "Дата старта игры ещё не настроена.", keyboard=build_user_menu(sheet, vk_user_id))
             return
-        send_message(vk, peer_id, format_countdown(game_start, config.timezone_name), keyboard=build_main_menu(True))
+        send_message(vk, peer_id, format_countdown(game_start, config.timezone_name), keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text in {"/map", MENU_MAP.lower()}:
-        send_message(vk, peer_id, "🗺 Карты полигона по миссиям:", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+        send_message(vk, peer_id, "🗺 Карты полигона по миссиям:", keyboard=build_user_menu(sheet, vk_user_id))
         for key, title in [("scenario1", "🗺 Эпизод 1"), ("scenario2", "🗺 Эпизод 2"), ("scenario3", "🗺 Эпизод 3")]:
             image_path = find_scenario_image_path(key)
             scenario_text = load_text_content(key, "Описание сценария пока не заполнено.")
@@ -427,9 +436,9 @@ def handle_menu_command(
         image_path = find_scenario_image_path(scenario_key)
         if image_path:
             attachment = upload_photo(vk, str(image_path))
-            send_message(vk, peer_id, scenario_text, attachment=attachment, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+            send_message(vk, peer_id, scenario_text, attachment=attachment, keyboard=build_user_menu(sheet, vk_user_id))
         else:
-            send_message(vk, peer_id, scenario_text, keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
+            send_message(vk, peer_id, scenario_text, keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     if normalized_text == PAYMENT_BUTTON.lower():
@@ -438,13 +447,13 @@ def handle_menu_command(
             send_message(vk, peer_id, "Сначала зарегистрируйся через /start, затем подтверди оплату.", keyboard=build_main_menu(False))
             return
         if str(player.get("Оплата", "")).strip().lower() == "оплачено":
-            send_message(vk, peer_id, "Оплата уже отмечена. Увидимся на полигоне.", keyboard=build_main_menu(True))
+            send_message(vk, peer_id, "Оплата уже отмечена. Увидимся на полигоне.", keyboard=build_user_menu(sheet, vk_user_id))
             return
         paid_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
         if sheet.mark_paid("vk", vk_user_id, paid_at):
-            send_message(vk, peer_id, "✅ Оплата отмечена.\n\nСтатус бойца обновлён в реестре MAD DAY.", keyboard=build_main_menu(True))
+            send_message(vk, peer_id, "✅ Оплата отмечена.\n\nСтатус бойца обновлён в реестре MAD DAY.", keyboard=build_user_menu(sheet, vk_user_id))
         else:
-            send_message(vk, peer_id, "Не удалось обновить оплату. Попробуй ещё раз позже.", keyboard=build_main_menu(True))
+            send_message(vk, peer_id, "Не удалось обновить оплату. Попробуй ещё раз позже.", keyboard=build_user_menu(sheet, vk_user_id))
         return
 
     send_main_menu(vk, sheet, peer_id, vk_user_id)
@@ -555,7 +564,9 @@ def main() -> None:
                         "payment_status": "не оплачено",
                         "payment_date": "",
                     }
+                    logger.info("Appending VK player to sheet: vk_id=%s id=%s", vk_user_id, player_id)
                     sheet.append_player(player)
+                    logger.info("VK player saved to sheet successfully: vk_id=%s id=%s", vk_user_id, player_id)
 
                     send_message(vk, peer_id, format_registration_result(player))
                     qr_image = make_qr_bytes(player_id)
@@ -593,6 +604,15 @@ def main() -> None:
             handle_menu_command(vk, sheet, config, peer_id, vk_user_id, text)
         except Exception:
             logger.exception("VK message handling failed")
+            if "peer_id" in locals():
+                try:
+                    send_message(
+                        vk,
+                        peer_id,
+                        "⚠ Не удалось завершить действие. Попробуй ещё раз.",
+                    )
+                except Exception:
+                    logger.exception("Failed to send VK error notification")
 
 
 if __name__ == "__main__":
