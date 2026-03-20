@@ -827,19 +827,19 @@ async def continue_after_faction_choice(
     context: ContextTypes.DEFAULT_TYPE,
     faction: str,
 ) -> int:
+    target_message = update.callback_query.message if update.callback_query else update.message
     config = get_config(context)
     if faction not in config.faction_limits:
-        await update.message.reply_text("Выбери фракцию кнопкой из списка.")
+        await target_message.reply_text("Выбери фракцию кнопкой из списка.")
         return FACTION
 
     sheet = get_sheet(context)
     counts = await asyncio.to_thread(sheet.faction_counts)
     if counts.get(faction, 0) >= config.faction_limits[faction]:
-        await update.message.reply_text(f"⚠ Фракция {faction} уже заполнена. Выбери другую.")
+        await target_message.reply_text(f"⚠ Фракция {faction} уже заполнена. Выбери другую.")
         return FACTION
 
     context.user_data["faction"] = faction
-    target_message = update.callback_query.message if update.callback_query else update.message
     await target_message.reply_text(
         "Введи фамилию и имя бойца. Пример: Иванов Иван",
         reply_markup=ReplyKeyboardRemove(),
@@ -871,7 +871,8 @@ async def get_faction_callback(update: Update, context: ContextTypes.DEFAULT_TYP
     }
     faction = callback_map.get(query.data)
     if not faction:
-        await query.message.reply_text("Выбор фракции не распознан. Попробуй ещё раз.")
+        target_message = query.message or update.effective_message
+        await target_message.reply_text("Выбор фракции не распознан. Попробуй ещё раз.")
         return FACTION
     return await continue_after_faction_choice(update, context, faction)
 
