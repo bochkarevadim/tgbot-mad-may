@@ -292,6 +292,14 @@ def handle_menu_command(
     normalized_text = text_lower.rstrip(".!? ")
 
     if normalized_text in INTRO_ALIASES:
+        if is_registered(sheet, vk_user_id):
+            send_message(
+                vk,
+                peer_id,
+                "Ты уже зарегистрирован. Открой профиль или используй меню ниже.",
+                keyboard=build_user_menu(sheet, vk_user_id),
+            )
+            return
         keyboard = build_keyboard([[START_REGISTRATION_BUTTON]], one_time=True)
         send_message(vk, peer_id, format_start_message(), keyboard=keyboard)
         return
@@ -597,6 +605,14 @@ def main() -> None:
 
             normalized_input = text.lower().strip().rstrip(".!? ")
             if normalized_input in REGISTRATION_TRIGGER_ALIASES:
+                if is_registered(sheet, vk_user_id):
+                    send_message(
+                        vk,
+                        peer_id,
+                        "Ты уже зарегистрирован. Открой профиль или используй меню ниже.",
+                        keyboard=build_user_menu(sheet, vk_user_id),
+                    )
+                    continue
                 sessions[vk_user_id] = {"state": SESSION_CALLSIGN, "data": {}}
                 send_message(vk, peer_id, "Введи позывной бойца:", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
                 continue

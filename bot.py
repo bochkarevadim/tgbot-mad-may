@@ -390,13 +390,90 @@ class RegistrationSheet:
         return client.open(self.config.spreadsheet_name).sheet1
 
     def ensure_headers(self) -> None:
-        first_row = self.worksheet.row_values(1)
-        if first_row[: len(SHEET_HEADERS)] == SHEET_HEADERS:
-            return
+        rows = self.worksheet.get_all_values()
+        first_row = rows[0] if rows else []
         if first_row[: len(LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE)] == LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE:
             self.migrate_vk_column_to_end()
-            return
-        self.worksheet.update(range_name="A1:K1", values=[SHEET_HEADERS])
+            rows = self.worksheet.get_all_values()
+            first_row = rows[0] if rows else []
+        if first_row[: len(SHEET_HEADERS)] != SHEET_HEADERS:
+            self.worksheet.update(range_name="A1:K1", values=[SHEET_HEADERS])
+            rows = self.worksheet.get_all_values()
+        if self.layout_needs_normalization(rows):
+            self.normalize_sheet_layout(rows)
+
+    @staticmethod
+    def first_nonempty_index(row: list[str]) -> int | None:
+        for index, value in enumerate(row):
+            if str(value).strip():
+                return index
+        return None
+
+    @staticmethod
+    def looks_like_legacy_telegram_row(row: list[str]) -> bool:
+        padded = row + [""] * max(0, 11 - len(row))
+        payment_status = str(padded[9]).strip().lower()
+        return (
+            str(padded[0]).strip().isdigit()
+            and not str(padded[7]).strip()
+            and bool(str(padded[8]).strip())
+            and payment_status in {"не оплачено", "оплачено"}
+        )
+
+    def layout_needs_normalization(self, rows: list[list[str]]) -> bool:
+        for row in rows[1:]:
+            if not any(str(cell).strip() for cell in row):
+                continue
+            first_index = self.first_nonempty_index(row)
+            if first_index is None:
+                continue
+            if first_index > 0:
+                return True
+            if self.looks_like_legacy_telegram_row(row[:11]):
+                return True
+        return False
+
+    def normalize_sheet_layout(self, rows: list[list[str]]) -> None:
+        normalized_rows = [SHEET_HEADERS]
+        for row in rows[1:]:
+            if not any(str(cell).strip() for cell in row):
+                continue
+
+            first_index = self.first_nonempty_index(row)
+            if first_index is None:
+                continue
+
+            shifted = row[first_index : first_index + len(SHEET_HEADERS)]
+            padded = shifted + [""] * max(0, len(SHEET_HEADERS) - len(shifted))
+            normalized = padded[: len(SHEET_HEADERS)]
+
+            if self.looks_like_legacy_telegram_row(normalized):
+                payment_date = str(normalized[10]).strip()
+                if payment_date.lower() == "не оплачено":
+                    payment_date = ""
+                normalized = [
+                    normalized[0],
+                    normalized[1],
+                    normalized[2],
+                    normalized[3],
+                    normalized[4],
+                    normalized[5],
+                    normalized[6],
+                    normalized[8],
+                    normalized[9],
+                    payment_date,
+                    "",
+                ]
+
+            normalized_rows.append(normalized)
+
+        end_cell = gspread.utils.rowcol_to_a1(self.worksheet.row_count, self.worksheet.col_count)
+        self.worksheet.batch_clear([f"A1:{end_cell}"])
+        self.worksheet.update(
+            range_name=f"A1:K{len(normalized_rows)}",
+            values=normalized_rows,
+            value_input_option="USER_ENTERED",
+        )
 
     def migrate_vk_column_to_end(self) -> None:
         rows = self.worksheet.get_all_values()
@@ -471,19 +548,23 @@ class RegistrationSheet:
         return sorted(vk_ids)
 
     def append_player(self, player: Dict[str, str]) -> None:
-        self.worksheet.append_row(
-            [
-                player["id"],
-                player["name"],
-                player["full_name"],
-                player["phone"],
-                player["faction"],
-                player["tariff"],
-                player.get("telegram_id", ""),
-                player["date"],
-                player["payment_status"],
-                player["payment_date"],
-                player.get("vk_id", ""),
+        next_row = len(self.worksheet.col_values(1)) + 1
+        self.worksheet.update(
+            range_name=f"A{next_row}:K{next_row}",
+            values=[
+                [
+                    player["id"],
+                    player["name"],
+                    player["full_name"],
+                    player["phone"],
+                    player["faction"],
+                    player["tariff"],
+                    player.get("telegram_id", ""),
+                    player["date"],
+                    player["payment_status"],
+                    player["payment_date"],
+                    player.get("vk_id", ""),
+                ]
             ],
             value_input_option="USER_ENTERED",
         )
