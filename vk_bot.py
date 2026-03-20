@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import mimetypes
 import os
 import random
 import tempfile
@@ -20,10 +21,18 @@ from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.upload import VkUpload
 
 from bot import (
+    ALLOWED_RECEIPT_EXTENSIONS,
     DEFAULT_FACTION_LIMITS,
     DEFAULT_TARIFF_MESSAGE,
     DEFAULT_TARIFFS,
+    DriveStorage,
+    PAYMENT_STATUS_PAID,
+    PAYMENT_STATUS_PENDING,
+    PAYMENT_STATUS_RECEIPT_UPLOADED,
     RegistrationSheet,
+    build_player_snapshot,
+    build_receipt_review_markup_dict,
+    format_admin_receipt_notice,
     find_scenario_image_path,
     format_countdown,
     format_admin_registration_notice,
@@ -31,6 +40,7 @@ from bot import (
     format_passport,
     format_registration_result,
     format_start_message,
+    is_supported_receipt_file,
     load_text_content,
     make_qr_bytes,
     make_qr_from_text,
@@ -44,6 +54,7 @@ from bot import (
     parse_tariff_buttons,
     parse_tariffs,
     progress_bar,
+    send_telegram_admin_notifications,
 )
 
 
@@ -87,6 +98,7 @@ SESSION_FACTION = "faction"
 SESSION_FULL_NAME = "full_name"
 SESSION_TARIFF = "tariff"
 SESSION_REREGISTER_CONFIRM = "reregister_confirm"
+SESSION_RECEIPT_UPLOAD = "receipt_upload"
 
 
 @dataclass
@@ -108,6 +120,8 @@ class VkConfig:
     game_start_at: str | None
     faction_chat_links: Dict[str, str]
     payment_link: str
+    drive_receipts_folder_id: str | None
+    receipt_public_links: bool
 
 
 def load_vk_config() -> VkConfig:
@@ -139,6 +153,8 @@ def load_vk_config() -> VkConfig:
         "PAYMENT_LINK",
         "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
     ).strip()
+    drive_receipts_folder_id = os.getenv("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID", "").strip() or None
+    receipt_public_links = os.getenv("RECEIPT_PUBLIC_LINKS", "").strip().lower() in {"1", "true", "yes", "on", "да"}
 
     if not spreadsheet_name and not spreadsheet_id:
         raise RuntimeError(
@@ -167,6 +183,8 @@ def load_vk_config() -> VkConfig:
         game_start_at=game_start_at,
         faction_chat_links=faction_chat_links,
         payment_link=payment_link,
+        drive_receipts_folder_id=drive_receipts_folder_id,
+        receipt_public_links=receipt_public_links,
     )
 
 
@@ -292,9 +310,14 @@ async def _notify_telegram_admins(config: VkConfig, text: str) -> None:
             logger.exception("Failed to send Telegram admin notification: admin_id=%s", admin_id)
 
 
-def notify_telegram_admins(config: VkConfig, text: str) -> None:
+def notify_telegram_admins(config: VkConfig, text: str, reply_markup: dict | None = None) -> None:
     try:
-        asyncio.run(_notify_telegram_admins(config, text))
+        send_telegram_admin_notifications(
+            telegram_token=config.telegram_token,
+            admin_ids=config.admin_ids,
+            text=text,
+            reply_markup=reply_markup,
+        )
     except Exception:
         logger.exception("Telegram admin notification task failed")
 
@@ -314,6 +337,37 @@ def upload_photo_from_bytes(vk, buffer: io.BytesIO, suffix: str = ".png") -> str
 
 def is_registered(sheet: RegistrationSheet, vk_user_id: int) -> bool:
     return sheet.player_by_vk_id(vk_user_id) is not None
+
+
+def extract_vk_receipt_attachment(message: dict) -> tuple[bytes, str, str] | None:
+    for attachment in message.get("attachments", []):
+        attachment_type = attachment.get("type")
+        if attachment_type == "doc":
+            document = attachment.get("doc", {})
+            file_url = document.get("url")
+            filename = document.get("title") or f"receipt-{document.get('id', 'doc')}"
+            mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            if not file_url or not is_supported_receipt_file(filename, mime_type):
+                continue
+            with urllib.request.urlopen(file_url, timeout=20) as response:
+                content = response.read()
+            return content, filename, mime_type
+        if attachment_type == "photo":
+            photo = attachment.get("photo", {})
+            sizes = photo.get("sizes", [])
+            if not sizes:
+                continue
+            largest = max(
+                sizes,
+                key=lambda item: (item.get("width", 0) * item.get("height", 0), item.get("width", 0)),
+            )
+            file_url = largest.get("url")
+            if not file_url:
+                continue
+            with urllib.request.urlopen(file_url, timeout=20) as response:
+                content = response.read()
+            return content, f"receipt-{photo.get('id', 'photo')}.jpg", "image/jpeg"
+    return None
 
 
 def send_main_menu(vk, sheet: RegistrationSheet, peer_id: int, vk_user_id: int) -> None:
@@ -540,29 +594,26 @@ def handle_menu_command(
         if not player:
             send_message(vk, peer_id, "Сначала зарегистрируйся через /start, затем подтверди оплату.", keyboard=build_main_menu(False))
             return
-        if str(player.get("Оплата", "")).strip().lower() == "оплачено":
+        payment_status = str(player.get("Оплата", "")).strip().lower()
+        if payment_status == PAYMENT_STATUS_PAID:
             send_message(vk, peer_id, "Оплата уже отмечена. Увидимся на полигоне.", keyboard=build_user_menu(sheet, vk_user_id))
             return
-        paid_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
-        if sheet.mark_paid("vk", vk_user_id, paid_at):
-            notify_telegram_admins(
-                config,
-                format_admin_payment_notice(
-                    {
-                        "id": str(player.get("ID", "")).strip(),
-                        "name": str(player.get("Позывной", "")).strip(),
-                        "full_name": str(player.get("Фамилия Имя", "")).strip(),
-                        "phone": str(player.get("Телефон", "")).strip(),
-                        "faction": str(player.get("Фракция", "")).strip(),
-                        "tariff": str(player.get("Тариф", "")).strip(),
-                    },
-                    "vk",
-                    paid_at,
-                ),
+        sessions[vk_user_id] = {"state": SESSION_RECEIPT_UPLOAD, "data": {}}
+        prompt = (
+            "Пришли PDF, JPG или PNG чека одним сообщением.\n\n"
+            "После проверки организатор подтвердит оплату вручную."
+        )
+        if payment_status == PAYMENT_STATUS_RECEIPT_UPLOADED:
+            prompt = (
+                "Чек уже загружен, но ты можешь заменить его.\n\n"
+                "Пришли новый PDF, JPG или PNG."
             )
-            send_message(vk, peer_id, "✅ Оплата отмечена.\n\nСтатус бойца обновлён в реестре MAD DAY.", keyboard=build_user_menu(sheet, vk_user_id))
-        else:
-            send_message(vk, peer_id, "Не удалось обновить оплату. Попробуй ещё раз позже.", keyboard=build_user_menu(sheet, vk_user_id))
+        send_message(
+            vk,
+            peer_id,
+            prompt,
+            keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True),
+        )
         return
 
     send_main_menu(vk, sheet, peer_id, vk_user_id)
@@ -571,6 +622,7 @@ def handle_menu_command(
 def main() -> None:
     config = load_vk_config()
     sheet = RegistrationSheet(config)
+    receipt_storage = DriveStorage(config)
 
     vk_session = vk_api.VkApi(token=config.vk_token)
     vk = vk_session.get_api()
@@ -587,13 +639,14 @@ def main() -> None:
             vk_user_id = int(message["from_id"])
             peer_id = int(message["peer_id"])
             text = str(message.get("text", "")).strip()
+            attachments = message.get("attachments", [])
             logger.info(
                 "Incoming VK message: from_id=%s peer_id=%s text=%r",
                 vk_user_id,
                 peer_id,
                 text,
             )
-            if not text:
+            if not text and not attachments:
                 continue
 
             if text == CANCEL_BUTTON:
@@ -670,8 +723,12 @@ def main() -> None:
                         "telegram_id": "",
                         "vk_id": str(vk_user_id),
                         "date": datetime.now(timezone).strftime("%d.%m.%Y %H:%M"),
-                        "payment_status": "не оплачено",
+                        "payment_status": PAYMENT_STATUS_PENDING,
                         "payment_date": "",
+                        "receipt_link": "",
+                        "receipt_uploaded_at": "",
+                        "payment_reviewer": "",
+                        "payment_comment": "",
                     }
                     logger.info("Appending VK player to sheet: vk_id=%s id=%s", vk_user_id, player_id)
                     sheet.append_player(player)
@@ -692,7 +749,7 @@ def main() -> None:
                     )
                     payment_text = load_text_content(
                         "payment",
-                        "ℹ ОПЛАТА УЧАСТИЯ\n\nПеревод участия:\nhttps://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
+                        "ℹ ОПЛАТА УЧАСТИЯ\n\nПеревод участия:\nhttps://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917\n\nПосле оплаты нажми кнопку ✅ Оплатил и пришли PDF, JPG или PNG чека.",
                     )
                     send_message(vk, peer_id, payment_text)
                     payment_qr = make_qr_from_text(config.payment_link, "mad-day-payment.png")
@@ -706,6 +763,58 @@ def main() -> None:
                     )
                     sessions.pop(vk_user_id, None)
                     send_main_menu(vk, sheet, peer_id, vk_user_id)
+                    continue
+
+                if state == SESSION_RECEIPT_UPLOAD:
+                    player = sheet.player_by_vk_id(vk_user_id)
+                    if not player:
+                        sessions.pop(vk_user_id, None)
+                        send_message(vk, peer_id, "Сначала зарегистрируйся через /start.", keyboard=build_main_menu(False))
+                        continue
+
+                    receipt_file = extract_vk_receipt_attachment(message)
+                    if not receipt_file:
+                        send_message(
+                            vk,
+                            peer_id,
+                            "Пришли PDF, JPG или PNG чека одним сообщением.",
+                            keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True),
+                        )
+                        continue
+
+                    content, filename, mime_type = receipt_file
+                    if len(content) > 10 * 1024 * 1024:
+                        send_message(vk, peer_id, "Файл слишком большой. Максимум 10 МБ.", keyboard=build_user_menu(sheet, vk_user_id))
+                        continue
+
+                    uploaded_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
+                    player_id = str(player.get("ID", "")).strip()
+                    upload_result = receipt_storage.upload_receipt(
+                        player_id,
+                        "vk",
+                        filename,
+                        content,
+                        mime_type,
+                    )
+                    sheet.record_receipt_upload(player_id, upload_result["link"], uploaded_at)
+                    refreshed_player = sheet.player_by_id(player_id) or player
+                    notify_telegram_admins(
+                        config,
+                        format_admin_receipt_notice(
+                            build_player_snapshot(refreshed_player),
+                            "vk",
+                            uploaded_at,
+                            upload_result["link"],
+                        ),
+                        reply_markup=build_receipt_review_markup_dict(player_id),
+                    )
+                    sessions.pop(vk_user_id, None)
+                    send_message(
+                        vk,
+                        peer_id,
+                        "🧾 Чек загружен.\n\nОрганизатор проверит оплату и подтвердит её вручную.",
+                        keyboard=build_user_menu(sheet, vk_user_id),
+                    )
                     continue
 
                 if state == SESSION_REREGISTER_CONFIRM:

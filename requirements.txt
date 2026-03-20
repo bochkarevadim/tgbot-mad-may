@@ -1,6 +1,7 @@
 python-telegram-bot>=21.11,<22
 gspread>=6.2,<7
 google-auth>=2.38,<3
+google-api-python-client>=2.170,<3
 qrcode[pil]>=7.4,<8
 python-dotenv>=1.0,<2
 vk_api>=11.9,<12
