@@ -58,9 +58,6 @@ MENU_INFO = "ℹ Информация об игре"
 MENU_BRIEFING = "📘 Брифинг фракции"
 MENU_FACTION_CHAT = "💬 Чат фракции"
 MENU_STATS = "📊 Баланс фракций"
-MENU_COUNTDOWN = "⏳ Таймер"
-MENU_PING = "/ping"
-MENU_MYID = "/myid"
 START_REGISTRATION_BUTTON = "⚔ Начать регистрацию"
 PAYMENT_BUTTON = "✅ Оплатил"
 CANCEL_BUTTON = "Отмена"
@@ -174,8 +171,6 @@ def build_main_menu(is_registered: bool) -> VkKeyboard:
         [MENU_RADIO, MENU_LORE],
         [MENU_INFO, MENU_BRIEFING],
         [MENU_FACTION_CHAT, MENU_STATS],
-        [MENU_COUNTDOWN],
-        [MENU_PING, MENU_MYID],
     ]
     if not is_registered:
         rows.insert(0, [MENU_REGISTER])
@@ -211,7 +206,15 @@ def send_message(vk, peer_id: int, text: str, keyboard: VkKeyboard | None = None
         params["keyboard"] = keyboard.get_keyboard()
     if attachment:
         params["attachment"] = attachment
-    vk.messages.send(**params)
+    logger.info(
+        "Sending VK message: peer_id=%s text=%r attachment=%s keyboard=%s",
+        peer_id,
+        text[:120],
+        bool(attachment),
+        bool(keyboard),
+    )
+    response = vk.messages.send(**params)
+    logger.info("VK message sent successfully: peer_id=%s response=%s", peer_id, response)
 
 
 def upload_photo(vk, path: str) -> str:
@@ -294,11 +297,11 @@ def handle_menu_command(
         )
         return
 
-    if normalized_text in {"/ping", MENU_PING.lower()}:
+    if normalized_text == "/ping":
         send_message(vk, peer_id, "OK", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if normalized_text in {"/myid", MENU_MYID.lower()}:
+    if normalized_text == "/myid":
         send_message(vk, peer_id, f"Твой VK ID: {vk_user_id}", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
@@ -394,7 +397,7 @@ def handle_menu_command(
         send_message(vk, peer_id, random.choice(messages), keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
         return
 
-    if normalized_text in {"/countdown", MENU_COUNTDOWN.lower()}:
+    if normalized_text == "/countdown":
         game_start = parse_game_start(config.game_start_at, config.timezone_name)
         if not game_start:
             send_message(vk, peer_id, "Дата старта игры ещё не настроена.", keyboard=build_main_menu(is_registered(sheet, vk_user_id)))
@@ -458,132 +461,135 @@ def main() -> None:
         if event.type != VkBotEventType.MESSAGE_NEW:
             continue
 
-        message = event.object.message
-        vk_user_id = int(message["from_id"])
-        peer_id = int(message["peer_id"])
-        text = str(message.get("text", "")).strip()
-        logger.info(
-            "Incoming VK message: from_id=%s peer_id=%s text=%r",
-            vk_user_id,
-            peer_id,
-            text,
-        )
-        if not text:
-            continue
-
-        if text == CANCEL_BUTTON:
-            sessions.pop(vk_user_id, None)
-            send_message(vk, peer_id, "Регистрация отменена. Если захочешь начать заново, напиши /start.")
-            send_main_menu(vk, sheet, peer_id, vk_user_id)
-            continue
-
-        if vk_user_id in sessions:
-            session = sessions[vk_user_id]
-            state = session["state"]
-            data = session["data"]
-
-            if state == SESSION_CALLSIGN:
-                callsign = normalize_callsign(text)
-                if not callsign:
-                    send_message(vk, peer_id, "Позывной должен быть длиной от 2 до 32 символов. Попробуй ещё раз.")
-                    continue
-                data["name"] = callsign
-                session["state"] = SESSION_PHONE
-                send_message(vk, peer_id, "Отправь телефон.", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
+        try:
+            message = event.object.message
+            vk_user_id = int(message["from_id"])
+            peer_id = int(message["peer_id"])
+            text = str(message.get("text", "")).strip()
+            logger.info(
+                "Incoming VK message: from_id=%s peer_id=%s text=%r",
+                vk_user_id,
+                peer_id,
+                text,
+            )
+            if not text:
                 continue
 
-            if state == SESSION_PHONE:
-                phone = normalize_phone(text)
-                if not phone:
-                    send_message(vk, peer_id, "Не удалось распознать телефон. Отправь номер ещё раз.")
-                    continue
-                data["phone"] = phone
-                session["state"] = SESSION_FACTION
-                send_message(vk, peer_id, "Выбери фракцию:", keyboard=build_faction_keyboard())
-                continue
-
-            if state == SESSION_FACTION:
-                faction = text
-                if faction not in config.faction_limits:
-                    send_message(vk, peer_id, "Выбери фракцию кнопкой из списка.")
-                    continue
-                counts = sheet.faction_counts()
-                if counts.get(faction, 0) >= config.faction_limits[faction]:
-                    send_message(vk, peer_id, f"⚠ Фракция {faction} уже заполнена. Выбери другую.")
-                    continue
-                data["faction"] = faction
-                session["state"] = SESSION_FULL_NAME
-                send_message(vk, peer_id, "Введи фамилию и имя бойца. Пример: Иванов Иван", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
-                continue
-
-            if state == SESSION_FULL_NAME:
-                full_name = normalize_full_name(text)
-                if not full_name:
-                    send_message(vk, peer_id, "Нужно указать фамилию и имя через пробел. Пример: Иванов Иван")
-                    continue
-                data["full_name"] = full_name
-                session["state"] = SESSION_TARIFF
-                send_message(vk, peer_id, f"Выбери тариф:\n\n{config.tariff_message}", keyboard=build_tariff_keyboard(config.tariff_buttons))
-                continue
-
-            if state == SESSION_TARIFF:
-                tariff_choice = text
-                tariff = config.tariff_button_map.get(tariff_choice, tariff_choice)
-                if tariff not in config.tariffs:
-                    send_message(vk, peer_id, "Выбери тариф кнопкой из списка.")
-                    continue
-
-                timezone = ZoneInfo(config.timezone_name)
-                player_id = sheet.next_player_id()
-                player = {
-                    "id": player_id,
-                    "name": data["name"],
-                    "full_name": data["full_name"],
-                    "phone": data["phone"],
-                    "faction": data["faction"],
-                    "tariff": tariff,
-                    "telegram_id": "",
-                    "vk_id": str(vk_user_id),
-                    "date": datetime.now(timezone).strftime("%d.%m.%Y %H:%M"),
-                    "payment_status": "не оплачено",
-                    "payment_date": "",
-                }
-                sheet.append_player(player)
-
-                send_message(vk, peer_id, format_registration_result(player))
-                qr_image = make_qr_bytes(player_id)
-                attachment = upload_photo_from_bytes(vk, qr_image)
-                send_message(vk, peer_id, "QR-код бойца", attachment=attachment)
-                send_message(
-                    vk,
-                    peer_id,
-                    "⚠ Сохрани этот QR код.\n\nОн понадобится для быстрого чек-ина перед началом игры.",
-                )
-                payment_text = load_text_content(
-                    "payment",
-                    "ℹ ОПЛАТА УЧАСТИЯ\n\nПеревод участия:\nhttps://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
-                )
-                send_message(vk, peer_id, payment_text)
-                payment_qr = make_qr_from_text(config.payment_link, "mad-day-payment.png")
-                payment_attachment = upload_photo_from_bytes(vk, payment_qr)
-                send_message(
-                    vk,
-                    peer_id,
-                    f"Ссылка для перевода:\n{config.payment_link}",
-                    attachment=payment_attachment,
-                    keyboard=build_keyboard([[PAYMENT_BUTTON]], one_time=True),
-                )
+            if text == CANCEL_BUTTON:
                 sessions.pop(vk_user_id, None)
+                send_message(vk, peer_id, "Регистрация отменена. Если захочешь начать заново, напиши /start.")
                 send_main_menu(vk, sheet, peer_id, vk_user_id)
                 continue
 
-        normalized_input = text.lower().strip().rstrip(".!? ")
-        if normalized_input in START_ALIASES:
-            sessions[vk_user_id] = {"state": SESSION_CALLSIGN, "data": {}}
-            send_message(vk, peer_id, "Введи позывной бойца:", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
-            continue
+            if vk_user_id in sessions:
+                session = sessions[vk_user_id]
+                state = session["state"]
+                data = session["data"]
 
-        handle_menu_command(vk, sheet, config, peer_id, vk_user_id, text)
+                if state == SESSION_CALLSIGN:
+                    callsign = normalize_callsign(text)
+                    if not callsign:
+                        send_message(vk, peer_id, "Позывной должен быть длиной от 2 до 32 символов. Попробуй ещё раз.")
+                        continue
+                    data["name"] = callsign
+                    session["state"] = SESSION_PHONE
+                    send_message(vk, peer_id, "Отправь телефон.", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
+                    continue
+
+                if state == SESSION_PHONE:
+                    phone = normalize_phone(text)
+                    if not phone:
+                        send_message(vk, peer_id, "Не удалось распознать телефон. Отправь номер ещё раз.")
+                        continue
+                    data["phone"] = phone
+                    session["state"] = SESSION_FACTION
+                    send_message(vk, peer_id, "Выбери фракцию:", keyboard=build_faction_keyboard())
+                    continue
+
+                if state == SESSION_FACTION:
+                    faction = text
+                    if faction not in config.faction_limits:
+                        send_message(vk, peer_id, "Выбери фракцию кнопкой из списка.")
+                        continue
+                    counts = sheet.faction_counts()
+                    if counts.get(faction, 0) >= config.faction_limits[faction]:
+                        send_message(vk, peer_id, f"⚠ Фракция {faction} уже заполнена. Выбери другую.")
+                        continue
+                    data["faction"] = faction
+                    session["state"] = SESSION_FULL_NAME
+                    send_message(vk, peer_id, "Введи фамилию и имя бойца. Пример: Иванов Иван", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
+                    continue
+
+                if state == SESSION_FULL_NAME:
+                    full_name = normalize_full_name(text)
+                    if not full_name:
+                        send_message(vk, peer_id, "Нужно указать фамилию и имя через пробел. Пример: Иванов Иван")
+                        continue
+                    data["full_name"] = full_name
+                    session["state"] = SESSION_TARIFF
+                    send_message(vk, peer_id, f"Выбери тариф:\n\n{config.tariff_message}", keyboard=build_tariff_keyboard(config.tariff_buttons))
+                    continue
+
+                if state == SESSION_TARIFF:
+                    tariff_choice = text
+                    tariff = config.tariff_button_map.get(tariff_choice, tariff_choice)
+                    if tariff not in config.tariffs:
+                        send_message(vk, peer_id, "Выбери тариф кнопкой из списка.")
+                        continue
+
+                    timezone = ZoneInfo(config.timezone_name)
+                    player_id = sheet.next_player_id()
+                    player = {
+                        "id": player_id,
+                        "name": data["name"],
+                        "full_name": data["full_name"],
+                        "phone": data["phone"],
+                        "faction": data["faction"],
+                        "tariff": tariff,
+                        "telegram_id": "",
+                        "vk_id": str(vk_user_id),
+                        "date": datetime.now(timezone).strftime("%d.%m.%Y %H:%M"),
+                        "payment_status": "не оплачено",
+                        "payment_date": "",
+                    }
+                    sheet.append_player(player)
+
+                    send_message(vk, peer_id, format_registration_result(player))
+                    qr_image = make_qr_bytes(player_id)
+                    attachment = upload_photo_from_bytes(vk, qr_image)
+                    send_message(vk, peer_id, "QR-код бойца", attachment=attachment)
+                    send_message(
+                        vk,
+                        peer_id,
+                        "⚠ Сохрани этот QR код.\n\nОн понадобится для быстрого чек-ина перед началом игры.",
+                    )
+                    payment_text = load_text_content(
+                        "payment",
+                        "ℹ ОПЛАТА УЧАСТИЯ\n\nПеревод участия:\nhttps://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
+                    )
+                    send_message(vk, peer_id, payment_text)
+                    payment_qr = make_qr_from_text(config.payment_link, "mad-day-payment.png")
+                    payment_attachment = upload_photo_from_bytes(vk, payment_qr)
+                    send_message(
+                        vk,
+                        peer_id,
+                        f"Ссылка для перевода:\n{config.payment_link}",
+                        attachment=payment_attachment,
+                        keyboard=build_keyboard([[PAYMENT_BUTTON]], one_time=True),
+                    )
+                    sessions.pop(vk_user_id, None)
+                    send_main_menu(vk, sheet, peer_id, vk_user_id)
+                    continue
+
+            normalized_input = text.lower().strip().rstrip(".!? ")
+            if normalized_input in START_ALIASES:
+                sessions[vk_user_id] = {"state": SESSION_CALLSIGN, "data": {}}
+                send_message(vk, peer_id, "Введи позывной бойца:", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
+                continue
+
+            handle_menu_command(vk, sheet, config, peer_id, vk_user_id, text)
+        except Exception:
+            logger.exception("VK message handling failed")
 
 
 if __name__ == "__main__":
