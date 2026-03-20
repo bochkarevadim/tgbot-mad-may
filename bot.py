@@ -74,6 +74,32 @@ SHEET_HEADERS = [
     "Дата",
     "Оплата",
     "Дата оплаты",
+    "VK ID",
+]
+LEGACY_SHEET_HEADERS = [
+    "ID",
+    "Позывной",
+    "Фамилия Имя",
+    "Телефон",
+    "Фракция",
+    "Тариф",
+    "Telegram ID",
+    "Дата",
+    "Оплата",
+    "Дата оплаты",
+]
+LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE = [
+    "ID",
+    "Позывной",
+    "Фамилия Имя",
+    "Телефон",
+    "Фракция",
+    "Тариф",
+    "Telegram ID",
+    "VK ID",
+    "Дата",
+    "Оплата",
+    "Дата оплаты",
 ]
 DEFAULT_FACTION_LIMITS = {
     "🔵 Корпус Стали": 60,
@@ -365,8 +391,51 @@ class RegistrationSheet:
 
     def ensure_headers(self) -> None:
         first_row = self.worksheet.row_values(1)
-        if first_row[: len(SHEET_HEADERS)] != SHEET_HEADERS:
-            self.worksheet.update(range_name="A1:J1", values=[SHEET_HEADERS])
+        if first_row[: len(SHEET_HEADERS)] == SHEET_HEADERS:
+            return
+        if first_row[: len(LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE)] == LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE:
+            self.migrate_vk_column_to_end()
+            return
+        self.worksheet.update(range_name="A1:K1", values=[SHEET_HEADERS])
+
+    def migrate_vk_column_to_end(self) -> None:
+        rows = self.worksheet.get_all_values()
+        migrated_rows = [SHEET_HEADERS]
+        for row in rows[1:]:
+            padded = row + [""] * max(0, 11 - len(row))
+            if len(row) >= 11:
+                migrated_rows.append(
+                    [
+                        padded[0],
+                        padded[1],
+                        padded[2],
+                        padded[3],
+                        padded[4],
+                        padded[5],
+                        padded[6],
+                        padded[8],
+                        padded[9],
+                        padded[10],
+                        padded[7],
+                    ]
+                )
+            else:
+                migrated_rows.append(
+                    [
+                        padded[0],
+                        padded[1],
+                        padded[2],
+                        padded[3],
+                        padded[4],
+                        padded[5],
+                        padded[6],
+                        padded[7],
+                        padded[8],
+                        padded[9],
+                        "",
+                    ]
+                )
+        self.worksheet.update(range_name=f"A1:K{len(migrated_rows)}", values=migrated_rows)
 
     def all_records(self) -> list[dict]:
         return self.worksheet.get_all_records(expected_headers=SHEET_HEADERS)
@@ -385,13 +454,21 @@ class RegistrationSheet:
                 counts[faction] += 1
         return counts
 
-    def registered_chat_ids(self) -> list[int]:
+    def registered_telegram_ids(self) -> list[int]:
         chat_ids = {
             int(str(record.get("Telegram ID", "")).strip())
             for record in self.all_records()
             if str(record.get("Telegram ID", "")).strip().isdigit()
         }
         return sorted(chat_ids)
+
+    def registered_vk_ids(self) -> list[int]:
+        vk_ids = {
+            int(str(record.get("VK ID", "")).strip())
+            for record in self.all_records()
+            if str(record.get("VK ID", "")).strip().isdigit()
+        }
+        return sorted(vk_ids)
 
     def append_player(self, player: Dict[str, str]) -> None:
         self.worksheet.append_row(
@@ -402,20 +479,23 @@ class RegistrationSheet:
                 player["phone"],
                 player["faction"],
                 player["tariff"],
-                player["chat_id"],
+                player.get("telegram_id", ""),
                 player["date"],
                 player["payment_status"],
                 player["payment_date"],
+                player.get("vk_id", ""),
             ],
             value_input_option="USER_ENTERED",
         )
 
-    def mark_paid(self, chat_id: int, paid_at: str) -> bool:
-        chat_id_str = str(chat_id)
+    def mark_paid(self, platform: str, platform_id: int, paid_at: str) -> bool:
+        platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
+        platform_index = SHEET_HEADERS.index(platform_key)
+        platform_id_str = str(platform_id)
         rows = self.worksheet.get_all_values()
         for row_index in range(len(rows), 1, -1):
             row = rows[row_index - 1]
-            if len(row) >= 7 and row[6].strip() == chat_id_str:
+            if len(row) > platform_index and row[platform_index].strip() == platform_id_str:
                 self.worksheet.update(
                     range_name=f"I{row_index}:J{row_index}",
                     values=[["оплачено", paid_at]],
@@ -423,12 +503,19 @@ class RegistrationSheet:
                 return True
         return False
 
-    def player_by_chat_id(self, chat_id: int) -> dict | None:
-        chat_id_str = str(chat_id)
+    def player_by_platform_id(self, platform: str, platform_id: int) -> dict | None:
+        platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
+        platform_id_str = str(platform_id)
         for record in reversed(self.all_records()):
-            if str(record.get("Telegram ID", "")).strip() == chat_id_str:
+            if str(record.get(platform_key, "")).strip() == platform_id_str:
                 return record
         return None
+
+    def player_by_telegram_id(self, chat_id: int) -> dict | None:
+        return self.player_by_platform_id("telegram", chat_id)
+
+    def player_by_vk_id(self, vk_id: int) -> dict | None:
+        return self.player_by_platform_id("vk", vk_id)
 
     def latest_players(self, limit: int = 30) -> list[dict]:
         records = self.all_records()
@@ -673,6 +760,52 @@ def format_registration_result(player: dict) -> str:
     )
 
 
+def format_admin_registration_notice(player: dict, source: str) -> str:
+    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    return "\n".join(
+        [
+            "🆕 Новая регистрация",
+            "",
+            f"Источник: {source_label}",
+            f"ID: {player['id']}",
+            f"Позывной: {player['name']}",
+            f"Имя: {player['full_name']}",
+            f"Телефон: {player['phone']}",
+            f"Фракция: {player['faction']}",
+            f"Тариф: {player['tariff']}",
+        ]
+    )
+
+
+def format_admin_payment_notice(player: dict, source: str, paid_at: str) -> str:
+    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    return "\n".join(
+        [
+            "💸 Оплата отмечена",
+            "",
+            f"Источник: {source_label}",
+            f"ID: {player['id']}",
+            f"Позывной: {player['name']}",
+            f"Имя: {player['full_name']}",
+            f"Фракция: {player['faction']}",
+            f"Тариф: {player['tariff']}",
+            f"Время оплаты: {paid_at}",
+        ]
+    )
+
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    config = get_config(context)
+    if not config.admin_ids:
+        return
+
+    for admin_id in sorted(config.admin_ids):
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception as exc:
+            logger.warning("Failed to send admin notification to %s: %s", admin_id, exc)
+
+
 def parse_radio_messages() -> list[str]:
     raw = load_text_content(
         "radio",
@@ -865,13 +998,14 @@ async def get_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "phone": context.user_data["phone"],
         "faction": context.user_data["faction"],
         "tariff": tariff,
-        "chat_id": str(update.effective_chat.id),
+        "telegram_id": str(update.effective_chat.id),
         "date": datetime.now(timezone).strftime("%d.%m.%Y %H:%M"),
         "payment_status": "не оплачено",
         "payment_date": "",
     }
 
     await asyncio.to_thread(sheet.append_player, player)
+    await notify_admins(context, format_admin_registration_notice(player, "telegram"))
     qr_image = await asyncio.to_thread(make_qr_bytes, player_id)
 
     await update.message.reply_text(
@@ -1033,7 +1167,7 @@ async def scenario3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet = get_sheet(context)
     config = get_config(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
 
     if not player:
         await update.message.reply_text(
@@ -1065,7 +1199,7 @@ async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def faction_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet = get_sheet(context)
     config = get_config(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
 
     if not player:
         await update.message.reply_text(
@@ -1118,7 +1252,7 @@ async def countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet = get_sheet(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
 
     if not player:
         await update.message.reply_text(
@@ -1149,6 +1283,18 @@ async def radio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(random.choice(messages), reply_markup=build_main_menu())
 
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("OK", reply_markup=build_main_menu())
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Не удалось определить пользователя.")
+        return
+    await update.message.reply_text(f"Твой Telegram ID: {user.id}", reply_markup=build_main_menu())
+
+
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = load_text_content(
         "info",
@@ -1163,7 +1309,7 @@ async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     sheet = get_sheet(context)
     config = get_config(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, query.from_user.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, query.from_user.id)
     if not player:
         await query.message.reply_text(
             "Сначала зарегистрируйся через /start, затем подтверди оплату.",
@@ -1179,7 +1325,7 @@ async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     paid_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
-    updated = await asyncio.to_thread(sheet.mark_paid, query.from_user.id, paid_at)
+    updated = await asyncio.to_thread(sheet.mark_paid, "telegram", query.from_user.id, paid_at)
     if not updated:
         await query.message.reply_text(
             "Не удалось обновить оплату в реестре. Попробуй ещё раз позже.",
@@ -1191,6 +1337,21 @@ async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "✅ Оплата отмечена.\n\n"
         "Статус бойца обновлён в реестре MAD DAY.",
         reply_markup=build_main_menu(),
+    )
+    await notify_admins(
+        context,
+        format_admin_payment_notice(
+            {
+                "id": str(player.get("ID", "")).strip(),
+                "name": str(player.get("Позывной", "")).strip(),
+                "full_name": str(player.get("Фамилия Имя", "")).strip(),
+                "phone": str(player.get("Телефон", "")).strip(),
+                "faction": str(player.get("Фракция", "")).strip(),
+                "tariff": str(player.get("Тариф", "")).strip(),
+            },
+            "telegram",
+            paid_at,
+        ),
     )
 
 
@@ -1229,7 +1390,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sheet = get_sheet(context)
-    chat_ids = await asyncio.to_thread(sheet.registered_chat_ids)
+    chat_ids = await asyncio.to_thread(sheet.registered_telegram_ids)
     success_count = 0
 
     for chat_id in chat_ids:
@@ -1296,6 +1457,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start - начать регистрацию\n"
         "/menu - открыть терминал\n"
         "/me - мой паспорт бойца\n"
+        "/ping - проверка бота\n"
+        "/myid - показать Telegram ID\n"
         "/stats - баланс фракций\n"
         "/lore - лор мира\n"
         "/map - карта полигона\n"
@@ -1329,7 +1492,7 @@ async def run_game_reminder(
 ) -> None:
     await asyncio.sleep(delay_seconds)
     sheet: RegistrationSheet = application.bot_data["sheet"]
-    chat_ids = await asyncio.to_thread(sheet.registered_chat_ids)
+    chat_ids = await asyncio.to_thread(sheet.registered_telegram_ids)
 
     if not chat_ids:
         logger.info("Reminder %s skipped: no registered chat IDs found.", reminder_label)
@@ -1442,6 +1605,8 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("map", send_map))
     application.add_handler(CommandHandler("schedule", schedule))
     application.add_handler(CommandHandler("radio", radio))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("myid", myid))
     application.add_handler(CommandHandler("info", info))
     application.add_handler(CallbackQueryHandler(payment_confirmed, pattern=f"^{PAYMENT_CONFIRMED_CALLBACK}$"))
     application.add_handler(CommandHandler("briefing", briefing))
