@@ -1367,6 +1367,18 @@ async def begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return CALLSIGN
 
 
+async def force_begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.application.bot_data.get("registration_open", True):
+        await update.message.reply_text("Регистрация сейчас закрыта.", reply_markup=build_main_menu())
+        return
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Введи позывной бойца:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.clear()
     await update.message.reply_text(
@@ -2333,6 +2345,8 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text.strip()
     if text == MENU_PROFILE:
         await me(update, context)
+    elif text == START_REGISTRATION_BUTTON:
+        await force_begin_registration(update, context)
     elif text == MENU_REGISTER:
         await start(update, context)
     elif text == MENU_REREGISTER:
