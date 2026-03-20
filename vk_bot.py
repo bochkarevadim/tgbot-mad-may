@@ -61,14 +61,16 @@ MENU_STATS = "📊 Баланс фракций"
 START_REGISTRATION_BUTTON = "⚔ Начать регистрацию"
 PAYMENT_BUTTON = "✅ Оплатил"
 CANCEL_BUTTON = "Отмена"
-START_ALIASES = {
+INTRO_ALIASES = {
     "/start",
     "start",
     "старт",
     "начать",
     "начать регистрацию",
-    START_REGISTRATION_BUTTON.lower(),
     MENU_REGISTER.lower(),
+}
+REGISTRATION_TRIGGER_ALIASES = {
+    START_REGISTRATION_BUTTON.lower(),
 }
 
 SESSION_CALLSIGN = "callsign"
@@ -280,7 +282,7 @@ def handle_menu_command(
     text_lower = text.lower().strip()
     normalized_text = text_lower.rstrip(".!? ")
 
-    if normalized_text in START_ALIASES:
+    if normalized_text in INTRO_ALIASES:
         keyboard = build_keyboard([[START_REGISTRATION_BUTTON]], one_time=True)
         send_message(vk, peer_id, format_start_message(), keyboard=keyboard)
         return
@@ -583,7 +585,7 @@ def main() -> None:
                     continue
 
             normalized_input = text.lower().strip().rstrip(".!? ")
-            if normalized_input in START_ALIASES:
+            if normalized_input in REGISTRATION_TRIGGER_ALIASES:
                 sessions[vk_user_id] = {"state": SESSION_CALLSIGN, "data": {}}
                 send_message(vk, peer_id, "Введи позывной бойца:", keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True))
                 continue
