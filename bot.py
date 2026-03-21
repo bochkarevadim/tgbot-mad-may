@@ -9,19 +9,24 @@ import mimetypes
 import os
 import random
 import re
+import secrets
+import tempfile
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Protocol
 from zoneinfo import ZoneInfo
 
+import cloudinary
+import cloudinary.uploader
 import gspread
 import qrcode
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseUpload
 from telegram import (
     InlineKeyboardButton,
@@ -219,6 +224,11 @@ class Config:
     admin_ids: set[int]
     faction_chat_links: Dict[str, str]
     payment_link: str
+    cloudinary_url: str | None
+    cloudinary_cloud_name: str | None
+    cloudinary_api_key: str | None
+    cloudinary_api_secret: str | None
+    cloudinary_receipts_folder: str
     drive_receipts_folder_id: str | None
     receipt_public_links: bool
 
@@ -247,6 +257,14 @@ def load_config() -> Config:
         "PAYMENT_LINK",
         "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
     ).strip()
+    cloudinary_url = os.getenv("CLOUDINARY_URL", "").strip() or None
+    cloudinary_cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip() or None
+    cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY", "").strip() or None
+    cloudinary_api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip() or None
+    cloudinary_receipts_folder = (
+        os.getenv("CLOUDINARY_RECEIPTS_FOLDER", "mad-day-receipts").strip()
+        or "mad-day-receipts"
+    )
     drive_receipts_folder_id = os.getenv("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID", "").strip() or None
     receipt_public_links = parse_bool(os.getenv("RECEIPT_PUBLIC_LINKS"))
 
@@ -279,6 +297,11 @@ def load_config() -> Config:
         admin_ids=admin_ids,
         faction_chat_links=faction_chat_links,
         payment_link=payment_link,
+        cloudinary_url=cloudinary_url,
+        cloudinary_cloud_name=cloudinary_cloud_name,
+        cloudinary_api_key=cloudinary_api_key,
+        cloudinary_api_secret=cloudinary_api_secret,
+        cloudinary_receipts_folder=cloudinary_receipts_folder,
         drive_receipts_folder_id=drive_receipts_folder_id,
         receipt_public_links=receipt_public_links,
     )
@@ -1166,6 +1189,157 @@ class DriveStorage:
         }
 
 
+class ReceiptStorage(Protocol):
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict: ...
+
+
+def has_cloudinary_config(config) -> bool:
+    return bool(
+        getattr(config, "cloudinary_url", None)
+        or (
+            getattr(config, "cloudinary_cloud_name", None)
+            and getattr(config, "cloudinary_api_key", None)
+            and getattr(config, "cloudinary_api_secret", None)
+        )
+    )
+
+
+class CloudinaryStorage:
+    def __init__(self, config) -> None:
+        self.config = config
+        self.folder = getattr(config, "cloudinary_receipts_folder", "mad-day-receipts")
+        config_kwargs = {"secure": True}
+        if getattr(config, "cloudinary_cloud_name", None):
+            config_kwargs["cloud_name"] = config.cloudinary_cloud_name
+            config_kwargs["api_key"] = config.cloudinary_api_key
+            config_kwargs["api_secret"] = config.cloudinary_api_secret
+        elif getattr(config, "cloudinary_url", None):
+            os.environ["CLOUDINARY_URL"] = config.cloudinary_url
+        else:
+            raise RuntimeError(
+                "Cloudinary is not configured. Set CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET."
+            )
+        cloudinary.config(**config_kwargs)
+
+    @staticmethod
+    def make_receipt_public_id(player_id: str, source: str, original_name: str) -> str:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).stem).strip("-")
+        if not stem:
+            stem = "receipt"
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        random_suffix = secrets.token_hex(8)
+        return f"mad-day-{source}-receipt-{player_id}-{timestamp}-{random_suffix}-{stem}"
+
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        suffix = Path(original_name).suffix or mimetypes.guess_extension(mime_type or "") or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_file.write(content)
+            temp_path = tmp_file.name
+        try:
+            result = cloudinary.uploader.upload(
+                temp_path,
+                resource_type="auto",
+                folder=self.folder,
+                public_id=self.make_receipt_public_id(player_id, source, original_name),
+                use_filename=False,
+                unique_filename=False,
+                overwrite=False,
+            )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return {
+            "id": result.get("public_id") or "",
+            "link": result.get("secure_url") or result.get("url") or "",
+        }
+
+
+class DisabledReceiptStorage:
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        raise RuntimeError(
+            "Receipt storage is not configured. Set CLOUDINARY_URL or GOOGLE_DRIVE_RECEIPTS_FOLDER_ID."
+        )
+
+
+def build_receipt_storage(config) -> ReceiptStorage:
+    if has_cloudinary_config(config):
+        return CloudinaryStorage(config)
+    if getattr(config, "drive_receipts_folder_id", None):
+        return DriveStorage(config)
+    return DisabledReceiptStorage()
+
+
+def explain_receipt_upload_error(exc: Exception) -> str:
+    combined_text = str(exc).lower()
+
+    if "receipt storage is not configured" in combined_text:
+        return (
+            "Не удалось сохранить чек.\n\n"
+            "В Render ещё не настроено файловое хранилище.\n"
+            "Добавь CLOUDINARY_URL и попробуй ещё раз."
+        )
+
+    if "cloudinary is not configured" in combined_text or "must supply api_key" in combined_text:
+        return (
+            "Не удалось сохранить чек в Cloudinary.\n\n"
+            "Проверь CLOUDINARY_URL или связку CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET."
+        )
+
+    if isinstance(exc, RuntimeError) and "GOOGLE_DRIVE_RECEIPTS_FOLDER_ID" in str(exc):
+        return (
+            "Не удалось сохранить чек.\n\n"
+            "В Render ещё не задана переменная GOOGLE_DRIVE_RECEIPTS_FOLDER_ID."
+        )
+
+    if isinstance(exc, HttpError):
+        content = ""
+        if getattr(exc, "content", None):
+            try:
+                content = exc.content.decode("utf-8", errors="ignore")
+            except Exception:
+                content = str(exc.content)
+        combined = f"{exc}\n{content}".lower()
+        if "storagequotaexceeded" in combined or "service accounts do not have storage quota" in combined:
+            return (
+                "Не удалось сохранить чек в Google Drive.\n\n"
+                "Причина: сервисный аккаунт не может писать файлы в обычный My Drive.\n"
+                "Нужно использовать Shared Drive или другое файловое хранилище."
+            )
+        if "insufficient permissions" in combined or "insufficientpermission" in combined:
+            return (
+                "Не удалось сохранить чек в Google Drive.\n\n"
+                "Проверь, что папка открыта для сервисного аккаунта с правами Editor."
+            )
+
+    return (
+        "Не удалось сохранить чек.\n\n"
+        "Проверь настройки Google Drive и попробуй ещё раз."
+    )
+
+
 async def notify_admins(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
@@ -1255,7 +1429,7 @@ def get_config(context: ContextTypes.DEFAULT_TYPE) -> Config:
     return context.application.bot_data["config"]
 
 
-def get_receipt_storage(context: ContextTypes.DEFAULT_TYPE) -> DriveStorage:
+def get_receipt_storage(context: ContextTypes.DEFAULT_TYPE) -> ReceiptStorage:
     return context.application.bot_data["receipt_storage"]
 
 
@@ -1958,9 +2132,7 @@ async def handle_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TY
     except Exception as exc:
         logger.exception("Failed to upload Telegram receipt for player_id=%s: %s", player_id, exc)
         await update.message.reply_text(
-            "Не удалось сохранить чек.\n\n"
-            "Скорее всего, ещё не настроена папка Google Drive для чеков.\n"
-            "Добавь GOOGLE_DRIVE_RECEIPTS_FOLDER_ID в Render и попробуй ещё раз.",
+            explain_receipt_upload_error(exc),
             reply_markup=build_main_menu(),
         )
         return
@@ -2265,7 +2437,7 @@ async def post_shutdown(application: Application) -> None:
 
 def build_application(config: Config) -> Application:
     sheet = RegistrationSheet(config)
-    receipt_storage = DriveStorage(config)
+    receipt_storage = build_receipt_storage(config)
     application = (
         Application.builder()
         .token(config.token)

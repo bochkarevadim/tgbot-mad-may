@@ -25,13 +25,14 @@ from bot import (
     DEFAULT_FACTION_LIMITS,
     DEFAULT_TARIFF_MESSAGE,
     DEFAULT_TARIFFS,
-    DriveStorage,
     PAYMENT_STATUS_PAID,
     PAYMENT_STATUS_PENDING,
     PAYMENT_STATUS_RECEIPT_UPLOADED,
     RegistrationSheet,
+    build_receipt_storage,
     build_player_snapshot,
     build_receipt_review_markup_dict,
+    explain_receipt_upload_error,
     format_admin_receipt_notice,
     find_scenario_image_path,
     format_countdown,
@@ -120,6 +121,11 @@ class VkConfig:
     game_start_at: str | None
     faction_chat_links: Dict[str, str]
     payment_link: str
+    cloudinary_url: str | None
+    cloudinary_cloud_name: str | None
+    cloudinary_api_key: str | None
+    cloudinary_api_secret: str | None
+    cloudinary_receipts_folder: str
     drive_receipts_folder_id: str | None
     receipt_public_links: bool
 
@@ -153,6 +159,14 @@ def load_vk_config() -> VkConfig:
         "PAYMENT_LINK",
         "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
     ).strip()
+    cloudinary_url = os.getenv("CLOUDINARY_URL", "").strip() or None
+    cloudinary_cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip() or None
+    cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY", "").strip() or None
+    cloudinary_api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip() or None
+    cloudinary_receipts_folder = (
+        os.getenv("CLOUDINARY_RECEIPTS_FOLDER", "mad-day-receipts").strip()
+        or "mad-day-receipts"
+    )
     drive_receipts_folder_id = os.getenv("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID", "").strip() or None
     receipt_public_links = os.getenv("RECEIPT_PUBLIC_LINKS", "").strip().lower() in {"1", "true", "yes", "on", "да"}
 
@@ -183,6 +197,11 @@ def load_vk_config() -> VkConfig:
         game_start_at=game_start_at,
         faction_chat_links=faction_chat_links,
         payment_link=payment_link,
+        cloudinary_url=cloudinary_url,
+        cloudinary_cloud_name=cloudinary_cloud_name,
+        cloudinary_api_key=cloudinary_api_key,
+        cloudinary_api_secret=cloudinary_api_secret,
+        cloudinary_receipts_folder=cloudinary_receipts_folder,
         drive_receipts_folder_id=drive_receipts_folder_id,
         receipt_public_links=receipt_public_links,
     )
@@ -622,7 +641,7 @@ def handle_menu_command(
 def main() -> None:
     config = load_vk_config()
     sheet = RegistrationSheet(config)
-    receipt_storage = DriveStorage(config)
+    receipt_storage = build_receipt_storage(config)
 
     vk_session = vk_api.VkApi(token=config.vk_token)
     vk = vk_session.get_api()
@@ -798,14 +817,12 @@ def main() -> None:
                             mime_type,
                         )
                         sheet.record_receipt_upload(player_id, upload_result["link"], uploaded_at)
-                    except Exception:
+                    except Exception as exc:
                         logger.exception("Failed to upload VK receipt for player_id=%s", player_id)
                         send_message(
                             vk,
                             peer_id,
-                            "Не удалось сохранить чек.\n\n"
-                            "Скорее всего, ещё не настроена папка Google Drive для чеков.\n"
-                            "Добавь GOOGLE_DRIVE_RECEIPTS_FOLDER_ID в Render и попробуй ещё раз.",
+                            explain_receipt_upload_error(exc),
                             keyboard=build_user_menu(sheet, vk_user_id),
                         )
                         continue

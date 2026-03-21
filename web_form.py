@@ -19,12 +19,13 @@ from bot import (
     DEFAULT_FACTION_LIMITS,
     DEFAULT_TARIFF_MESSAGE,
     DEFAULT_TARIFFS,
-    DriveStorage,
     PAYMENT_STATUS_PAID,
     PAYMENT_STATUS_PENDING,
     RegistrationSheet,
+    build_receipt_storage,
     build_player_snapshot,
     build_receipt_review_markup_dict,
+    explain_receipt_upload_error,
     find_scenario_image_path,
     format_admin_receipt_notice,
     format_admin_registration_notice,
@@ -70,6 +71,11 @@ class WebConfig:
     tariff_button_map: dict[str, str]
     payment_link: str
     faction_chat_links: dict[str, str]
+    cloudinary_url: str | None
+    cloudinary_cloud_name: str | None
+    cloudinary_api_key: str | None
+    cloudinary_api_secret: str | None
+    cloudinary_receipts_folder: str
     drive_receipts_folder_id: str | None
     receipt_public_links: bool
 
@@ -95,6 +101,14 @@ def load_web_config() -> WebConfig:
         "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
     ).strip()
     faction_chat_links = parse_faction_chat_links(os.getenv("FACTION_CHAT_LINKS"))
+    cloudinary_url = os.getenv("CLOUDINARY_URL", "").strip() or None
+    cloudinary_cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip() or None
+    cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY", "").strip() or None
+    cloudinary_api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip() or None
+    cloudinary_receipts_folder = (
+        os.getenv("CLOUDINARY_RECEIPTS_FOLDER", "mad-day-receipts").strip()
+        or "mad-day-receipts"
+    )
     drive_receipts_folder_id = os.getenv("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID", "").strip() or None
     receipt_public_links = parse_bool(os.getenv("RECEIPT_PUBLIC_LINKS"))
 
@@ -120,6 +134,11 @@ def load_web_config() -> WebConfig:
         tariff_button_map=tariff_button_map,
         payment_link=payment_link,
         faction_chat_links=faction_chat_links,
+        cloudinary_url=cloudinary_url,
+        cloudinary_cloud_name=cloudinary_cloud_name,
+        cloudinary_api_key=cloudinary_api_key,
+        cloudinary_api_secret=cloudinary_api_secret,
+        cloudinary_receipts_folder=cloudinary_receipts_folder,
         drive_receipts_folder_id=drive_receipts_folder_id,
         receipt_public_links=receipt_public_links,
     )
@@ -127,7 +146,7 @@ def load_web_config() -> WebConfig:
 
 CONFIG = load_web_config()
 SHEET = RegistrationSheet(CONFIG)
-STORAGE = DriveStorage(CONFIG)
+STORAGE = build_receipt_storage(CONFIG)
 TIMEZONE = ZoneInfo(CONFIG.timezone_name)
 
 
@@ -679,14 +698,12 @@ class WebFormHandler(BaseHTTPRequestHandler):
                 reply_markup=build_receipt_review_markup_dict(player_id),
             )
             self._send_html(_render_upload_success(refreshed_player, upload_result["link"]))
-        except Exception:
+        except Exception as exc:
             logger.exception("Failed to upload web receipt")
             self._send_html(
                 _render_register_page(
                     receipt_values={"player_id": player_id, "phone": values.get("phone", "")},
-                    receipt_errors=[
-                        "Не удалось загрузить чек. Скорее всего, ещё не настроена папка Google Drive для чеков.",
-                    ],
+                    receipt_errors=[explain_receipt_upload_error(exc)],
                 ),
                 status=500,
             )
