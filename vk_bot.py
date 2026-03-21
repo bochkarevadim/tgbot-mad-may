@@ -609,6 +609,7 @@ def handle_menu_command(
         return
 
     if normalized_text == PAYMENT_BUTTON.lower():
+        logger.info("VK payment button pressed: vk_user_id=%s peer_id=%s", vk_user_id, peer_id)
         player = sheet.player_by_vk_id(vk_user_id)
         if not player:
             send_message(vk, peer_id, "Сначала зарегистрируйся через /start, затем подтверди оплату.", keyboard=build_main_menu(False))
@@ -627,12 +628,7 @@ def handle_menu_command(
                 "Чек уже загружен, но ты можешь заменить его.\n\n"
                 "Пришли новый PDF, JPG или PNG."
             )
-        send_message(
-            vk,
-            peer_id,
-            prompt,
-            keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True),
-        )
+        send_message(vk, peer_id, prompt)
         return
 
     send_main_menu(vk, sheet, peer_id, vk_user_id)
