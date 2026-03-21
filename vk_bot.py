@@ -791,7 +791,23 @@ def main() -> None:
                         send_message(vk, peer_id, "Сначала зарегистрируйся через /start.", keyboard=build_main_menu(False))
                         continue
 
-                    receipt_file = extract_vk_receipt_attachment(message)
+                    try:
+                        receipt_file = extract_vk_receipt_attachment(message)
+                    except Exception as exc:
+                        logger.exception(
+                            "Failed to read VK receipt attachment: vk_user_id=%s attachment_types=%s",
+                            vk_user_id,
+                            [item.get("type") for item in message.get("attachments", [])],
+                        )
+                        send_message(
+                            vk,
+                            peer_id,
+                            "Не удалось прочитать вложение.\n\n"
+                            "Пришли чек одним сообщением как PDF, JPG или PNG.",
+                            keyboard=build_keyboard([[CANCEL_BUTTON]], one_time=True),
+                        )
+                        continue
+
                     if not receipt_file:
                         send_message(
                             vk,
