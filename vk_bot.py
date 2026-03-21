@@ -426,6 +426,7 @@ def handle_menu_command(
     vk,
     sheet: RegistrationSheet,
     config: VkConfig,
+    sessions: dict[int, dict],
     peer_id: int,
     vk_user_id: int,
     text: str,
@@ -902,7 +903,7 @@ def main() -> None:
                     )
                     continue
 
-            handle_menu_command(vk, sheet, config, peer_id, vk_user_id, text)
+            handle_menu_command(vk, sheet, config, sessions, peer_id, vk_user_id, text)
         except Exception:
             logger.exception("VK message handling failed")
             if "peer_id" in locals():
