@@ -453,6 +453,47 @@ class RegistrationSheet:
             rows = self.worksheet.get_all_values()
         if self.layout_needs_normalization(rows):
             self.normalize_sheet_layout(rows)
+            rows = self.worksheet.get_all_values()
+        self.refresh_payment_status_formatting(rows)
+
+    @staticmethod
+    def payment_status_cell_format(status: str) -> dict:
+        normalized = str(status).strip().lower()
+        if normalized == PAYMENT_STATUS_PAID:
+            return {
+                "backgroundColor": {"red": 0.85, "green": 0.94, "blue": 0.83},
+                "textFormat": {"foregroundColor": {"red": 0.11, "green": 0.37, "blue": 0.13}, "bold": True},
+            }
+        if normalized == PAYMENT_STATUS_RECEIPT_UPLOADED:
+            return {
+                "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8},
+                "textFormat": {"foregroundColor": {"red": 0.55, "green": 0.35, "blue": 0.0}, "bold": True},
+            }
+        return {
+            "backgroundColor": {"red": 0.97, "green": 0.82, "blue": 0.82},
+            "textFormat": {"foregroundColor": {"red": 0.62, "green": 0.11, "blue": 0.11}, "bold": True},
+        }
+
+    def apply_payment_status_format(self, row_index: int, status: str) -> None:
+        try:
+            self.worksheet.format(
+                f"I{row_index}",
+                {
+                    "horizontalAlignment": "CENTER",
+                    **self.payment_status_cell_format(status),
+                },
+            )
+        except Exception as exc:
+            logger.warning("Failed to format payment status cell I%s: %s", row_index, exc)
+
+    def refresh_payment_status_formatting(self, rows: list[list[str]] | None = None) -> None:
+        rows = rows or self.worksheet.get_all_values()
+        for row_index in range(2, len(rows) + 1):
+            row = rows[row_index - 1]
+            if not any(str(cell).strip() for cell in row):
+                continue
+            padded = row + [""] * max(0, len(SHEET_HEADERS) - len(row))
+            self.apply_payment_status_format(row_index, padded[8])
 
     @staticmethod
     def first_nonempty_index(row: list[str]) -> int | None:
@@ -632,6 +673,7 @@ class RegistrationSheet:
             ],
             value_input_option="USER_ENTERED",
         )
+        self.apply_payment_status_format(next_row, player["payment_status"])
 
     def mark_paid(self, platform: str, platform_id: int, paid_at: str) -> bool:
         platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
@@ -645,6 +687,7 @@ class RegistrationSheet:
                     range_name=f"I{row_index}:J{row_index}",
                     values=[["оплачено", paid_at]],
                 )
+                self.apply_payment_status_format(row_index, PAYMENT_STATUS_PAID)
                 return True
         return False
 
@@ -681,6 +724,7 @@ class RegistrationSheet:
                 values=[padded[: len(SHEET_HEADERS)]],
                 value_input_option="USER_ENTERED",
             )
+            self.apply_payment_status_format(row_index, padded[8])
             return True
         return False
 
@@ -707,6 +751,7 @@ class RegistrationSheet:
                 values=[padded[: len(SHEET_HEADERS)]],
                 value_input_option="USER_ENTERED",
             )
+            self.apply_payment_status_format(row_index, padded[8])
             return True
         return False
 
