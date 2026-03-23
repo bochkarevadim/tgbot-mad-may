@@ -737,6 +737,23 @@ class RegistrationSheet:
         records = self.all_records()
         return records[-limit:]
 
+    def unpaid_telegram_ids(self) -> list[int]:
+        chat_ids: list[int] = []
+        seen: set[int] = set()
+        for record in self.all_records():
+            payment_status = str(record.get("Оплата", "")).strip().lower()
+            if payment_status == PAYMENT_STATUS_PAID:
+                continue
+            chat_id_value = str(record.get("Telegram ID", "")).strip()
+            if not chat_id_value.isdigit():
+                continue
+            chat_id = int(chat_id_value)
+            if chat_id in seen:
+                continue
+            seen.add(chat_id)
+            chat_ids.append(chat_id)
+        return chat_ids
+
 
 def normalize_callsign(raw_value: str) -> str | None:
     value = raw_value.strip()
@@ -1308,6 +1325,28 @@ def explain_receipt_upload_error(exc: Exception) -> str:
             "Проверь CLOUDINARY_URL или связку CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET."
         )
 
+    if any(
+        pattern in combined_text
+        for pattern in (
+            "cloudinary_url",
+            "cloud name",
+            "cloud_name",
+            "api key",
+            "api_key",
+            "api secret",
+            "api_secret",
+            "invalid signature",
+            "unknown api key",
+            "authorization required",
+        )
+    ):
+        return (
+            "Не удалось сохранить чек в Cloudinary.\n\n"
+            "Скорее всего, неверно заполнен CLOUDINARY_URL в Render.\n"
+            "Проверь, что в Key стоит CLOUDINARY_URL, а в Value только строка вида "
+            "cloudinary://API_KEY:API_SECRET@CLOUD_NAME"
+        )
+
     if isinstance(exc, RuntimeError) and "GOOGLE_DRIVE_RECEIPTS_FOLDER_ID" in str(exc):
         return (
             "Не удалось сохранить чек.\n\n"
@@ -1336,7 +1375,7 @@ def explain_receipt_upload_error(exc: Exception) -> str:
 
     return (
         "Не удалось сохранить чек.\n\n"
-        "Проверь настройки Google Drive и попробуй ещё раз."
+        "Проверь настройки Cloudinary в Render и попробуй ещё раз."
     )
 
 
@@ -2273,6 +2312,36 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def broadcast_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+
+    message = " ".join(context.args).strip()
+    if not message:
+        await update.message.reply_text(
+            "Использование: /broadcast_unpaid текст сообщения",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    sheet = get_sheet(context)
+    chat_ids = await asyncio.to_thread(sheet.unpaid_telegram_ids)
+    success_count = 0
+
+    for chat_id in chat_ids:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=message)
+            success_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            logger.warning("Broadcast to unpaid failed for chat_id=%s: %s", chat_id, exc)
+
+    await update.message.reply_text(
+        f"Рассылка неоплатившим завершена. Доставлено: {success_count}",
+        reply_markup=build_main_menu(),
+    )
+
+
 def make_players_export_csv(records: list[dict]) -> io.BytesIO:
     text_buffer = io.StringIO()
     writer = csv.DictWriter(text_buffer, fieldnames=SHEET_HEADERS)
@@ -2342,6 +2411,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "\nОрганизатор:\n"
         "/players\n"
         "/broadcast текст\n"
+        "/broadcast_unpaid текст\n"
         "/export\n"
         "/close_registration\n"
         "/open_registration",
@@ -2493,6 +2563,7 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("countdown", countdown))
     application.add_handler(CommandHandler("players", players))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("broadcast_unpaid", broadcast_unpaid))
     application.add_handler(CommandHandler("export", export_players))
     application.add_handler(CommandHandler("close_registration", close_registration))
     application.add_handler(CommandHandler("open_registration", open_registration))
