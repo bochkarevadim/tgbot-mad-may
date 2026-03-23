@@ -2387,6 +2387,107 @@ async def broadcast_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
+async def sendtg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /sendtg TELEGRAM_ID текст сообщения",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    telegram_id_raw = context.args[0].strip()
+    if not telegram_id_raw.isdigit():
+        await update.message.reply_text(
+            "TELEGRAM_ID должен быть числом.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    message = " ".join(context.args[1:]).strip()
+    if not message:
+        await update.message.reply_text(
+            "После TELEGRAM_ID укажи текст сообщения.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    try:
+        await context.bot.send_message(chat_id=int(telegram_id_raw), text=message)
+    except Exception as exc:
+        logger.warning("Direct sendtg failed for chat_id=%s: %s", telegram_id_raw, exc)
+        await update.message.reply_text(
+            f"Не удалось отправить сообщение на Telegram ID {telegram_id_raw}.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    await update.message.reply_text(
+        f"Сообщение отправлено на Telegram ID {telegram_id_raw}.",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def sendplayer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /sendplayer ID_ИГРОКА текст сообщения",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    player_id = context.args[0].strip()
+    message = " ".join(context.args[1:]).strip()
+    if not message:
+        await update.message.reply_text(
+            "После ID игрока укажи текст сообщения.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    sheet = get_sheet(context)
+    player = await asyncio.to_thread(sheet.player_by_id, player_id)
+    if not player:
+        await update.message.reply_text(
+            f"Игрок с ID {player_id} не найден.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    telegram_id = str(player.get("Telegram ID", "")).strip()
+    if not telegram_id.isdigit():
+        await update.message.reply_text(
+            f"У игрока {player_id} не заполнен Telegram ID.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    try:
+        await context.bot.send_message(chat_id=int(telegram_id), text=message)
+    except Exception as exc:
+        logger.warning(
+            "Direct sendplayer failed for player_id=%s telegram_id=%s: %s",
+            player_id,
+            telegram_id,
+            exc,
+        )
+        await update.message.reply_text(
+            f"Не удалось отправить сообщение игроку {player_id}.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    await update.message.reply_text(
+        f"Сообщение отправлено игроку {player_id} ({telegram_id}).",
+        reply_markup=build_main_menu(),
+    )
+
+
 def make_players_export_csv(records: list[dict]) -> io.BytesIO:
     text_buffer = io.StringIO()
     writer = csv.DictWriter(text_buffer, fieldnames=SHEET_HEADERS)
@@ -2457,6 +2558,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/players\n"
         "/broadcast текст\n"
         "/broadcast_unpaid текст\n"
+        "/sendtg TELEGRAM_ID текст\n"
+        "/sendplayer ID_ИГРОКА текст\n"
         "/export\n"
         "/close_registration\n"
         "/open_registration",
@@ -2609,6 +2712,8 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("players", players))
     application.add_handler(CommandHandler("broadcast", broadcast))
     application.add_handler(CommandHandler("broadcast_unpaid", broadcast_unpaid))
+    application.add_handler(CommandHandler("sendtg", sendtg))
+    application.add_handler(CommandHandler("sendplayer", sendplayer))
     application.add_handler(CommandHandler("export", export_players))
     application.add_handler(CommandHandler("close_registration", close_registration))
     application.add_handler(CommandHandler("open_registration", open_registration))
