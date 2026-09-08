@@ -4,14 +4,29 @@
 # the fallback. serveo.log is overwritten fresh on every (re)start and its
 # "Forwarding HTTP traffic from ..." line has the current public URL - the
 # URL is random and changes every time this restarts.
+#
+# serveo's anonymous forwarding silently expires after a while (the ssh
+# process keeps running but traffic stops working - it does not exit, so
+# Task Scheduler's restart-on-failure never fires on its own). To guard
+# against that, this wrapper force-restarts the tunnel every 30 minutes.
 
 $ProjectDir = $PSScriptRoot
 $LogFile = Join-Path $ProjectDir "serveo.log"
 $ErrFile = Join-Path $ProjectDir "serveo_err.log"
 
-Start-Process -FilePath "ssh.exe" `
+$p = Start-Process -FilePath "ssh.exe" `
     -ArgumentList "-o StrictHostKeyChecking=no -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -R 80:localhost:8080 serveo.net" `
     -WorkingDirectory $ProjectDir `
     -RedirectStandardOutput $LogFile `
     -RedirectStandardError $ErrFile `
-    -NoNewWindow -Wait
+    -NoNewWindow -PassThru
+
+$p.WaitForExit(30 * 60 * 1000) | Out-Null
+
+if (-not $p.HasExited) {
+    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+}
+
+# Always exit non-zero so Task Scheduler's "restart on failure" relaunches
+# this script - both on an ssh crash and on our own 30-minute refresh.
+exit 1
