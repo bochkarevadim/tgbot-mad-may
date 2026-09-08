@@ -511,7 +511,7 @@ def handle_menu_command(
         return
 
     if normalized_text in {"/info", MENU_INFO.lower()}:
-        text = load_text_content("info", "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 5.0")
+        text = load_text_content("info", "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 6.0")
         send_message(vk, peer_id, text, keyboard=build_user_menu(sheet, vk_user_id))
         return
 

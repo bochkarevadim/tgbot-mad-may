@@ -2118,7 +2118,7 @@ async def cancel_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = load_text_content(
         "info",
-        "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 5.0",
+        "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 6.0",
     )
     await update.message.reply_text(text, reply_markup=build_main_menu())
 

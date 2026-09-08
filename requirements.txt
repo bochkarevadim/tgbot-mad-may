@@ -6,3 +6,4 @@ google-api-python-client>=2.170,<3
 qrcode[pil]>=7.4,<8
 python-dotenv>=1.0,<2
 vk_api>=11.9,<12
+tzdata>=2024.1; sys_platform == "win32"

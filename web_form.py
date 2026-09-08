@@ -393,7 +393,7 @@ def _render_register_page(
     return _render_layout(
         "MAD DAY — регистрация и чек",
         f"""
-        <h1>MAD DAY 5.0</h1>
+        <h1>MAD DAY 6.0</h1>
         <p class="muted">Регистрация игрока и загрузка чека оплаты в одном терминале.</p>
         {notice_block}
         <div class="grid">
