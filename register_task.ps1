@@ -31,14 +31,7 @@ foreach ($t in $Tasks) {
     Write-Host "Task '$($t.Name)' registered."
 }
 
-# Public tunnel for the web form via serveo.net (SSH reverse tunnel, no
-# account/signup needed - Cloudflare Tunnel does not work on this network).
-# The public URL is random and changes every restart - read it from
-# serveo.log after (re)start.
-$TunnelScript = Join-Path $ProjectDir "run_tunnel.ps1"
-$TunnelAction = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument ('-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $TunnelScript + '"') `
-    -WorkingDirectory $ProjectDir
-$TunnelTrigger = New-ScheduledTaskTrigger -AtStartup
-Register-ScheduledTask -TaskName "MadDay-WebTunnel" -Action $TunnelAction -Trigger $TunnelTrigger -Settings $Settings -Principal $Principal -Force | Out-Null
-Write-Host "Task 'MadDay-WebTunnel' registered."
+# The web form (port 8080) is published to the internet via the router's
+# built-in Keenetic KeenDNS remote-access feature (Settings -> Домен ->
+# KeenDNS -> "Доступ к веб-приложениям"), not a PC-side tunnel. No extra
+# task is needed here for that.
