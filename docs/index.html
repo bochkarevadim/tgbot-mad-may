@@ -10,61 +10,56 @@
       }
       body {
         margin: 0;
+        min-height: 100vh;
+        display: flex;
+        align-items: center;
+        justify-content: center;
         font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
         background: radial-gradient(circle at top, #1f1f1f, #0b0b0b);
         color: #f5f5f5;
       }
-      .header {
-        padding: 24px 16px 8px;
+      .card {
+        max-width: 480px;
+        margin: 24px;
+        padding: 32px 28px;
         text-align: center;
-      }
-      .header h1 {
-        margin: 0 0 8px;
-        font-size: 24px;
-        letter-spacing: 0.4px;
-      }
-      .header p {
-        margin: 0;
-        color: #cfcfcf;
-      }
-      .frame-wrap {
-        max-width: 1100px;
-        margin: 0 auto;
-        padding: 16px;
-      }
-      iframe {
-        width: 100%;
-        height: 1200px;
-        border: none;
+        background: #151515;
         border-radius: 16px;
-        background: #111;
         box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
       }
-      .fallback {
-        text-align: center;
-        padding: 12px 16px 32px;
+      h1 {
+        margin: 0 0 8px;
+        font-size: 26px;
+        letter-spacing: 0.4px;
       }
-      .fallback a {
-        color: #f39c12;
+      p {
+        margin: 0 0 24px;
+        color: #cfcfcf;
+        line-height: 1.5;
+      }
+      .go {
+        display: inline-block;
+        padding: 14px 28px;
+        border-radius: 10px;
+        background: #f39c12;
+        color: #111;
         font-weight: 700;
+        font-size: 17px;
         text-decoration: none;
+      }
+      .note {
+        margin: 20px 0 0;
+        font-size: 13px;
+        color: #8a8a8a;
       }
     </style>
   </head>
   <body>
-    <header class="header">
+    <div class="card">
       <h1>Регистрация MAD DAY 6.0</h1>
-      <p>27 сентября 2026 · Если форма не отображается, открой её по ссылке ниже.</p>
-    </header>
-    <main class="frame-wrap">
-      <iframe
-        src="https://32f1f346e66f287e-46-20-105-46.serveousercontent.com"
-        title="Регистрация без Telegram"
-        loading="lazy"
-      ></iframe>
-    </main>
-    <div class="fallback">
-      <a href="https://32f1f346e66f287e-46-20-105-46.serveousercontent.com" target="_blank" rel="noopener">Открыть форму в новом окне</a>
+      <p>27 сентября 2026 · Holmgard Park</p>
+      <a class="go" href="https://32f1f346e66f287e-46-20-105-46.serveousercontent.com" target="_blank" rel="noopener">Открыть форму регистрации</a>
+      <p class="note">Форма откроется в новой вкладке. При первом переходе увидишь предупреждение от туннельного сервиса — это нормально, нажми «Continue to Site».</p>
     </div>
   </body>
 </html>
