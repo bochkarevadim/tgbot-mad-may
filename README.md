@@ -114,6 +114,43 @@ PAYMENT_LINK=https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917
 python bot.py
 ```
 
+
+## Веб-форма для регистрации без Telegram
+
+Если нужно регистрировать игроков без Telegram, запусти веб-форму.
+
+1. Установи зависимости (см. выше).
+2. Запусти:
+
+```bash
+python web_form.py
+```
+
+По умолчанию форма стартует на порту `8080`. Можно задать `PORT` или `WEB_PORT`.
+
+Форма использует те же переменные окружения Google Sheets. В колонку `Telegram ID`
+записывается `WEB`, чтобы было видно, что регистрация прошла через сайт.
+
+## Публичная ссылка (Render + GitHub Pages)
+
+### 1) Render (бэкенд формы)
+
+1. Подключи репозиторий в Render и выбери **Web Service**.
+2. Render автоматически прочитает `render.yaml`.
+3. В переменных окружения задай:
+   - `GOOGLE_SHEETS_SPREADSHEET` или `GOOGLE_SHEETS_SPREADSHEET_ID`
+   - `GOOGLE_CREDENTIALS_JSON` (полный JSON сервисного аккаунта)
+   - `REGISTRATION_TIMEZONE` (например `Europe/Moscow`)
+   - `PAYMENT_LINK`
+4. После деплоя получишь публичную ссылку вида `https://...onrender.com`.
+
+### 2) GitHub Pages (страница с iframe)
+
+1. Открой `docs/index.html` и замени `RENDER_FORM_URL` на ссылку Render.
+2. В GitHub включи Pages для ветки `codex/web-form`, папка `/docs`.
+
+После этого публичная страница будет показывать форму через iframe.
+
 ## Команды бота
 
 - `/start` — начать регистрацию

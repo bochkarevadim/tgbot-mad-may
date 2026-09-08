@@ -5,19 +5,29 @@ import csv
 import io
 import json
 import logging
+import mimetypes
 import os
 import random
 import re
+import secrets
+import tempfile
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Protocol
 from zoneinfo import ZoneInfo
 
+import cloudinary
+import cloudinary.uploader
 import gspread
 import qrcode
 from dotenv import load_dotenv
 from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+from googleapiclient.http import MediaIoBaseUpload
 from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -57,8 +67,20 @@ MENU_INFO = "ℹ Информация об игре"
 MENU_BRIEFING = "📘 Брифинг фракции"
 MENU_FACTION_CHAT = "💬 Чат фракции"
 MENU_STATS = "📊 Баланс фракций"
+MENU_REREGISTER = "♻ Перерегистрация"
+REREGISTER_CONFIRM_BUTTON = "✅ Подтвердить перерегистрацию"
+REREGISTER_CANCEL_BUTTON = "↩ Отмена"
 PAYMENT_CONFIRMED_CALLBACK = "payment_confirmed"
+RECEIPT_APPROVE_CALLBACK_PREFIX = "receipt_approve:"
+RECEIPT_REJECT_CALLBACK_PREFIX = "receipt_reject:"
 FACTION_CALLBACK_PREFIX = "faction:"
+RECEIPT_UPLOAD_PENDING_KEY = "receipt_upload_pending"
+PAYMENT_STATUS_PENDING = "не оплачено"
+PAYMENT_STATUS_RECEIPT_UPLOADED = "чек загружен"
+PAYMENT_STATUS_PAID = "оплачено"
+PAYMENT_STATUS_REJECTED = "чек отклонён"
+ALLOWED_RECEIPT_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
+MAX_RECEIPT_FILE_SIZE = 10 * 1024 * 1024
 FACTION_BUTTONS = {
     "🔵 Вступить в Корпус Стали": "🔵 Корпус Стали",
     "🔴 Вступить в Новый Штат": "🔴 Новый Штат",
@@ -74,7 +96,38 @@ SHEET_HEADERS = [
     "Дата",
     "Оплата",
     "Дата оплаты",
+    "VK ID",
+    "Ссылка на чек",
+    "Дата загрузки чека",
+    "Проверил",
+    "Комментарий",
 ]
+LEGACY_SHEET_HEADERS = [
+    "ID",
+    "Позывной",
+    "Фамилия Имя",
+    "Телефон",
+    "Фракция",
+    "Тариф",
+    "Telegram ID",
+    "Дата",
+    "Оплата",
+    "Дата оплаты",
+]
+LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE = [
+    "ID",
+    "Позывной",
+    "Фамилия Имя",
+    "Телефон",
+    "Фракция",
+    "Тариф",
+    "Telegram ID",
+    "VK ID",
+    "Дата",
+    "Оплата",
+    "Дата оплаты",
+]
+HEADER_RANGE = "A1:O1"
 DEFAULT_FACTION_LIMITS = {
     "🔵 Корпус Стали": 60,
     "🔴 Новый Штат": 60,
@@ -155,6 +208,7 @@ GAME_REMINDER_PLAN = [
 @dataclass
 class Config:
     token: str
+    vk_token: str | None
     spreadsheet_name: str
     spreadsheet_id: str | None
     credentials_file: str
@@ -170,11 +224,19 @@ class Config:
     admin_ids: set[int]
     faction_chat_links: Dict[str, str]
     payment_link: str
+    cloudinary_url: str | None
+    cloudinary_cloud_name: str | None
+    cloudinary_api_key: str | None
+    cloudinary_api_secret: str | None
+    cloudinary_receipts_folder: str
+    drive_receipts_folder_id: str | None
+    receipt_public_links: bool
 
 
 def load_config() -> Config:
     load_dotenv()
     token = os.getenv("TOKEN", "").strip()
+    vk_token = os.getenv("VK_TOKEN", "").strip() or None
     spreadsheet_name = os.getenv("GOOGLE_SHEETS_SPREADSHEET", "MAD DAY REGISTRATION").strip()
     spreadsheet_id = os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID", "").strip() or None
     credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "credentials.json").strip()
@@ -195,6 +257,16 @@ def load_config() -> Config:
         "PAYMENT_LINK",
         "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917",
     ).strip()
+    cloudinary_url = os.getenv("CLOUDINARY_URL", "").strip() or None
+    cloudinary_cloud_name = os.getenv("CLOUDINARY_CLOUD_NAME", "").strip() or None
+    cloudinary_api_key = os.getenv("CLOUDINARY_API_KEY", "").strip() or None
+    cloudinary_api_secret = os.getenv("CLOUDINARY_API_SECRET", "").strip() or None
+    cloudinary_receipts_folder = (
+        os.getenv("CLOUDINARY_RECEIPTS_FOLDER", "mad-day-receipts").strip()
+        or "mad-day-receipts"
+    )
+    drive_receipts_folder_id = os.getenv("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID", "").strip() or None
+    receipt_public_links = parse_bool(os.getenv("RECEIPT_PUBLIC_LINKS"))
 
     if not token:
         raise RuntimeError("Environment variable TOKEN is required.")
@@ -209,6 +281,7 @@ def load_config() -> Config:
 
     return Config(
         token=token,
+        vk_token=vk_token,
         spreadsheet_name=spreadsheet_name,
         spreadsheet_id=spreadsheet_id,
         credentials_file=credentials_file,
@@ -224,7 +297,20 @@ def load_config() -> Config:
         admin_ids=admin_ids,
         faction_chat_links=faction_chat_links,
         payment_link=payment_link,
+        cloudinary_url=cloudinary_url,
+        cloudinary_cloud_name=cloudinary_cloud_name,
+        cloudinary_api_key=cloudinary_api_key,
+        cloudinary_api_secret=cloudinary_api_secret,
+        cloudinary_receipts_folder=cloudinary_receipts_folder,
+        drive_receipts_folder_id=drive_receipts_folder_id,
+        receipt_public_links=receipt_public_links,
     )
+
+
+def parse_bool(raw_value: str | None) -> bool:
+    if not raw_value:
+        return False
+    return raw_value.strip().lower() in {"1", "true", "yes", "on", "да"}
 
 
 def parse_faction_limits(raw_value: str | None) -> Dict[str, int]:
@@ -348,15 +434,7 @@ class RegistrationSheet:
             "https://www.googleapis.com/auth/spreadsheets",
             "https://www.googleapis.com/auth/drive",
         ]
-
-        if self.config.credentials_json:
-            credentials_info = json.loads(self.config.credentials_json)
-            credentials = Credentials.from_service_account_info(credentials_info, scopes=scopes)
-        else:
-            credentials = Credentials.from_service_account_file(
-                self.config.credentials_file,
-                scopes=scopes,
-            )
+        credentials = build_google_credentials(self.config, scopes)
 
         client = gspread.authorize(credentials)
         if self.config.spreadsheet_id:
@@ -364,9 +442,178 @@ class RegistrationSheet:
         return client.open(self.config.spreadsheet_name).sheet1
 
     def ensure_headers(self) -> None:
-        first_row = self.worksheet.row_values(1)
+        rows = self.worksheet.get_all_values()
+        first_row = rows[0] if rows else []
+        if first_row[: len(LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE)] == LEGACY_SHEET_HEADERS_WITH_VK_BEFORE_DATE:
+            self.migrate_vk_column_to_end()
+            rows = self.worksheet.get_all_values()
+            first_row = rows[0] if rows else []
         if first_row[: len(SHEET_HEADERS)] != SHEET_HEADERS:
-            self.worksheet.update(range_name="A1:J1", values=[SHEET_HEADERS])
+            self.worksheet.update(range_name=HEADER_RANGE, values=[SHEET_HEADERS])
+            rows = self.worksheet.get_all_values()
+        if self.layout_needs_normalization(rows):
+            self.normalize_sheet_layout(rows)
+            rows = self.worksheet.get_all_values()
+        self.refresh_payment_status_formatting(rows)
+
+    @staticmethod
+    def payment_status_cell_format(status: str) -> dict:
+        normalized = str(status).strip().lower()
+        if normalized == PAYMENT_STATUS_PAID:
+            return {
+                "backgroundColor": {"red": 0.85, "green": 0.94, "blue": 0.83},
+                "textFormat": {"foregroundColor": {"red": 0.11, "green": 0.37, "blue": 0.13}, "bold": True},
+            }
+        if normalized == PAYMENT_STATUS_RECEIPT_UPLOADED:
+            return {
+                "backgroundColor": {"red": 1.0, "green": 0.95, "blue": 0.8},
+                "textFormat": {"foregroundColor": {"red": 0.55, "green": 0.35, "blue": 0.0}, "bold": True},
+            }
+        return {
+            "backgroundColor": {"red": 0.97, "green": 0.82, "blue": 0.82},
+            "textFormat": {"foregroundColor": {"red": 0.62, "green": 0.11, "blue": 0.11}, "bold": True},
+        }
+
+    def apply_payment_status_format(self, row_index: int, status: str) -> None:
+        try:
+            self.worksheet.format(
+                f"I{row_index}",
+                {
+                    "horizontalAlignment": "CENTER",
+                    **self.payment_status_cell_format(status),
+                },
+            )
+        except Exception as exc:
+            logger.warning("Failed to format payment status cell I%s: %s", row_index, exc)
+
+    def refresh_payment_status_formatting(self, rows: list[list[str]] | None = None) -> None:
+        rows = rows or self.worksheet.get_all_values()
+        for row_index in range(2, len(rows) + 1):
+            row = rows[row_index - 1]
+            if not any(str(cell).strip() for cell in row):
+                continue
+            padded = row + [""] * max(0, len(SHEET_HEADERS) - len(row))
+            self.apply_payment_status_format(row_index, padded[8])
+
+    @staticmethod
+    def first_nonempty_index(row: list[str]) -> int | None:
+        for index, value in enumerate(row):
+            if str(value).strip():
+                return index
+        return None
+
+    @staticmethod
+    def looks_like_legacy_telegram_row(row: list[str]) -> bool:
+        padded = row + [""] * max(0, 11 - len(row))
+        payment_status = str(padded[9]).strip().lower()
+        return (
+            str(padded[0]).strip().isdigit()
+            and not str(padded[7]).strip()
+            and bool(str(padded[8]).strip())
+            and payment_status in {"не оплачено", "оплачено"}
+        )
+
+    def layout_needs_normalization(self, rows: list[list[str]]) -> bool:
+        for row in rows[1:]:
+            if not any(str(cell).strip() for cell in row):
+                continue
+            first_index = self.first_nonempty_index(row)
+            if first_index is None:
+                continue
+            if first_index > 0:
+                return True
+            if self.looks_like_legacy_telegram_row(row[:11]):
+                return True
+        return False
+
+    def normalize_sheet_layout(self, rows: list[list[str]]) -> None:
+        normalized_rows = [SHEET_HEADERS]
+        for row in rows[1:]:
+            if not any(str(cell).strip() for cell in row):
+                continue
+
+            first_index = self.first_nonempty_index(row)
+            if first_index is None:
+                continue
+
+            shifted = row[first_index : first_index + len(SHEET_HEADERS)]
+            padded = shifted + [""] * max(0, len(SHEET_HEADERS) - len(shifted))
+            normalized = padded[: len(SHEET_HEADERS)]
+
+            if self.looks_like_legacy_telegram_row(normalized):
+                payment_date = str(normalized[10]).strip()
+                if payment_date.lower() == "не оплачено":
+                    payment_date = ""
+                normalized = [
+                    normalized[0],
+                    normalized[1],
+                    normalized[2],
+                    normalized[3],
+                    normalized[4],
+                    normalized[5],
+                    normalized[6],
+                    normalized[8],
+                    normalized[9],
+                    payment_date,
+                    "",
+                ]
+
+            normalized_rows.append(normalized)
+
+        end_cell = gspread.utils.rowcol_to_a1(self.worksheet.row_count, self.worksheet.col_count)
+        self.worksheet.batch_clear([f"A1:{end_cell}"])
+        self.worksheet.update(
+            range_name=f"A1:O{len(normalized_rows)}",
+            values=normalized_rows,
+            value_input_option="USER_ENTERED",
+        )
+
+    def migrate_vk_column_to_end(self) -> None:
+        rows = self.worksheet.get_all_values()
+        migrated_rows = [SHEET_HEADERS]
+        for row in rows[1:]:
+            padded = row + [""] * max(0, 11 - len(row))
+            if len(row) >= 11:
+                migrated_rows.append(
+                    [
+                        padded[0],
+                        padded[1],
+                        padded[2],
+                        padded[3],
+                        padded[4],
+                        padded[5],
+                        padded[6],
+                        padded[8],
+                        padded[9],
+                        padded[10],
+                        padded[7],
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
+            else:
+                migrated_rows.append(
+                    [
+                        padded[0],
+                        padded[1],
+                        padded[2],
+                        padded[3],
+                        padded[4],
+                        padded[5],
+                        padded[6],
+                        padded[7],
+                        padded[8],
+                        padded[9],
+                        "",
+                        "",
+                        "",
+                        "",
+                        "",
+                    ]
+                )
+        self.worksheet.update(range_name=f"A1:O{len(migrated_rows)}", values=migrated_rows)
 
     def all_records(self) -> list[dict]:
         return self.worksheet.get_all_records(expected_headers=SHEET_HEADERS)
@@ -385,7 +632,7 @@ class RegistrationSheet:
                 counts[faction] += 1
         return counts
 
-    def registered_chat_ids(self) -> list[int]:
+    def registered_telegram_ids(self) -> list[int]:
         chat_ids = {
             int(str(record.get("Telegram ID", "")).strip())
             for record in self.all_records()
@@ -393,46 +640,164 @@ class RegistrationSheet:
         }
         return sorted(chat_ids)
 
+    def registered_vk_ids(self) -> list[int]:
+        vk_ids = {
+            int(str(record.get("VK ID", "")).strip())
+            for record in self.all_records()
+            if str(record.get("VK ID", "")).strip().isdigit()
+        }
+        return sorted(vk_ids)
+
     def append_player(self, player: Dict[str, str]) -> None:
-        self.worksheet.append_row(
-            [
-                player["id"],
-                player["name"],
-                player["full_name"],
-                player["phone"],
-                player["faction"],
-                player["tariff"],
-                player["chat_id"],
-                player["date"],
-                player["payment_status"],
-                player["payment_date"],
+        next_row = len(self.worksheet.col_values(1)) + 1
+        self.worksheet.update(
+            range_name=f"A{next_row}:O{next_row}",
+            values=[
+                [
+                    player["id"],
+                    player["name"],
+                    player["full_name"],
+                    player["phone"],
+                    player["faction"],
+                    player["tariff"],
+                    player.get("telegram_id", ""),
+                    player["date"],
+                    player["payment_status"],
+                    player["payment_date"],
+                    player.get("vk_id", ""),
+                    player.get("receipt_link", ""),
+                    player.get("receipt_uploaded_at", ""),
+                    player.get("payment_reviewer", ""),
+                    player.get("payment_comment", ""),
+                ]
             ],
             value_input_option="USER_ENTERED",
         )
+        self.apply_payment_status_format(next_row, player["payment_status"])
 
-    def mark_paid(self, chat_id: int, paid_at: str) -> bool:
-        chat_id_str = str(chat_id)
+    def mark_paid(self, platform: str, platform_id: int, paid_at: str) -> bool:
+        platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
+        platform_index = SHEET_HEADERS.index(platform_key)
+        platform_id_str = str(platform_id)
         rows = self.worksheet.get_all_values()
         for row_index in range(len(rows), 1, -1):
             row = rows[row_index - 1]
-            if len(row) >= 7 and row[6].strip() == chat_id_str:
+            if len(row) > platform_index and row[platform_index].strip() == platform_id_str:
                 self.worksheet.update(
                     range_name=f"I{row_index}:J{row_index}",
                     values=[["оплачено", paid_at]],
                 )
+                self.apply_payment_status_format(row_index, PAYMENT_STATUS_PAID)
                 return True
         return False
 
-    def player_by_chat_id(self, chat_id: int) -> dict | None:
-        chat_id_str = str(chat_id)
+    def player_by_platform_id(self, platform: str, platform_id: int) -> dict | None:
+        platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
+        platform_id_str = str(platform_id)
         for record in reversed(self.all_records()):
-            if str(record.get("Telegram ID", "")).strip() == chat_id_str:
+            if str(record.get(platform_key, "")).strip() == platform_id_str:
                 return record
         return None
+
+    def player_by_id(self, player_id: str) -> dict | None:
+        player_id_str = str(player_id).strip()
+        for record in reversed(self.all_records()):
+            if str(record.get("ID", "")).strip() == player_id_str:
+                return record
+        return None
+
+    def record_receipt_upload(self, player_id: str, receipt_link: str, uploaded_at: str) -> bool:
+        rows = self.worksheet.get_all_values()
+        for row_index in range(len(rows), 1, -1):
+            row = rows[row_index - 1]
+            if str(row[0]).strip() != str(player_id).strip():
+                continue
+            padded = row + [""] * max(0, len(SHEET_HEADERS) - len(row))
+            padded[8] = PAYMENT_STATUS_RECEIPT_UPLOADED
+            padded[9] = ""
+            padded[11] = receipt_link
+            padded[12] = uploaded_at
+            padded[13] = ""
+            padded[14] = ""
+            self.worksheet.update(
+                range_name=f"A{row_index}:O{row_index}",
+                values=[padded[: len(SHEET_HEADERS)]],
+                value_input_option="USER_ENTERED",
+            )
+            self.apply_payment_status_format(row_index, padded[8])
+            return True
+        return False
+
+    def review_payment(
+        self,
+        player_id: str,
+        approved: bool,
+        reviewed_at: str,
+        reviewer: str,
+        comment: str = "",
+    ) -> bool:
+        rows = self.worksheet.get_all_values()
+        for row_index in range(len(rows), 1, -1):
+            row = rows[row_index - 1]
+            if str(row[0]).strip() != str(player_id).strip():
+                continue
+            padded = row + [""] * max(0, len(SHEET_HEADERS) - len(row))
+            padded[8] = PAYMENT_STATUS_PAID if approved else PAYMENT_STATUS_REJECTED
+            padded[9] = reviewed_at if approved else ""
+            padded[13] = reviewer
+            padded[14] = comment
+            self.worksheet.update(
+                range_name=f"A{row_index}:O{row_index}",
+                values=[padded[: len(SHEET_HEADERS)]],
+                value_input_option="USER_ENTERED",
+            )
+            self.apply_payment_status_format(row_index, padded[8])
+            return True
+        return False
+
+    def player_by_telegram_id(self, chat_id: int) -> dict | None:
+        return self.player_by_platform_id("telegram", chat_id)
+
+    def player_by_vk_id(self, vk_id: int) -> dict | None:
+        return self.player_by_platform_id("vk", vk_id)
+
+    def delete_player_by_platform_id(self, platform: str, platform_id: int) -> int:
+        platform_key = "Telegram ID" if platform == "telegram" else "VK ID"
+        platform_index = SHEET_HEADERS.index(platform_key)
+        platform_id_str = str(platform_id)
+        rows = self.worksheet.get_all_values()
+        matched_rows: list[int] = []
+
+        for row_index in range(2, len(rows) + 1):
+            row = rows[row_index - 1]
+            if len(row) > platform_index and row[platform_index].strip() == platform_id_str:
+                matched_rows.append(row_index)
+
+        for row_index in reversed(matched_rows):
+            self.worksheet.delete_rows(row_index)
+
+        return len(matched_rows)
 
     def latest_players(self, limit: int = 30) -> list[dict]:
         records = self.all_records()
         return records[-limit:]
+
+    def unpaid_telegram_ids(self) -> list[int]:
+        chat_ids: list[int] = []
+        seen: set[int] = set()
+        for record in self.all_records():
+            payment_status = str(record.get("Оплата", "")).strip().lower()
+            if payment_status == PAYMENT_STATUS_PAID:
+                continue
+            chat_id_value = str(record.get("Telegram ID", "")).strip()
+            if not chat_id_value.isdigit():
+                continue
+            chat_id = int(chat_id_value)
+            if chat_id in seen:
+                continue
+            seen.add(chat_id)
+            chat_ids.append(chat_id)
+        return chat_ids
 
 
 def normalize_callsign(raw_value: str) -> str | None:
@@ -498,8 +863,7 @@ def progress_bar(current: int, limit: int, width: int = 10) -> str:
 
 
 def format_passport(player: dict) -> str:
-    payment_status_raw = str(player.get("payment_status", "")).strip().lower()
-    payment_status = "оплачено" if payment_status_raw == "оплачено" else "не оплачено"
+    payment_status = format_payment_status_label(str(player.get("payment_status", "")).strip())
     return "\n".join(
         [
             "☢ ПАСПОРТ БОЙЦА",
@@ -514,6 +878,17 @@ def format_passport(player: dict) -> str:
             "Статус: зарегистрирован",
         ]
     )
+
+
+def format_payment_status_label(payment_status: str) -> str:
+    normalized = payment_status.strip().lower()
+    if normalized == PAYMENT_STATUS_PAID:
+        return PAYMENT_STATUS_PAID
+    if normalized == PAYMENT_STATUS_RECEIPT_UPLOADED:
+        return PAYMENT_STATUS_RECEIPT_UPLOADED
+    if normalized == PAYMENT_STATUS_REJECTED:
+        return PAYMENT_STATUS_REJECTED
+    return PAYMENT_STATUS_PENDING
 
 
 def format_countdown(target: datetime, timezone_name: str) -> str:
@@ -557,7 +932,7 @@ def format_start_message() -> str:
         "🗺 получить карту полигона\n"
         "📋 узнать расписание операций\n"
         "📻 слушать Радио Пустоши\n\n"
-        "Готов присоединиться к войне?\n\n"
+        "Готов присоединиться к битве ?\n\n"
         "Нажми кнопку ниже, чтобы начать регистрацию."
     )
 
@@ -593,10 +968,22 @@ def build_main_menu() -> ReplyKeyboardMarkup:
             [MENU_RADIO, MENU_LORE],
             [MENU_INFO, MENU_BRIEFING],
             [MENU_FACTION_CHAT, MENU_STATS],
+            [MENU_REREGISTER],
         ],
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Выбери действие терминала",
+    )
+
+
+def build_reregister_confirmation_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [REREGISTER_CONFIRM_BUTTON],
+            [REREGISTER_CANCEL_BUTTON],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
     )
 
 
@@ -634,7 +1021,7 @@ async def send_payment_info(message_target, config: Config) -> None:
         "ℹ ОПЛАТА УЧАСТИЯ\n\n"
         "Перевод участия:\n"
         "https://www.sberbank.com/sms/pbpn?requisiteNumber=79217300917\n\n"
-        "Если оплатил, нажми кнопку ✅ Оплатил.",
+        "После оплаты нажми кнопку ✅ Оплатил и пришли PDF, JPG или PNG чека.",
     )
     qr_image = await asyncio.to_thread(
         make_qr_from_text,
@@ -674,7 +1061,12 @@ def format_registration_result(player: dict) -> str:
 
 
 def format_admin_registration_notice(player: dict, source: str) -> str:
-    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    source_labels = {
+        "telegram": "Telegram-бот",
+        "vk": "VK-бот",
+        "web": "Веб-форма",
+    }
+    source_label = source_labels.get(source, source)
     return "\n".join(
         [
             "🆕 Новая регистрация",
@@ -691,7 +1083,12 @@ def format_admin_registration_notice(player: dict, source: str) -> str:
 
 
 def format_admin_payment_notice(player: dict, source: str, paid_at: str) -> str:
-    source_label = "Telegram-бот" if source == "telegram" else "Веб-форма"
+    source_labels = {
+        "telegram": "Telegram-бот",
+        "vk": "VK-бот",
+        "web": "Веб-форма",
+    }
+    source_label = source_labels.get(source, source)
     return "\n".join(
         [
             "💸 Оплата отмечена",
@@ -707,16 +1104,383 @@ def format_admin_payment_notice(player: dict, source: str, paid_at: str) -> str:
     )
 
 
-async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+def format_admin_receipt_notice(player: dict, source: str, uploaded_at: str, receipt_link: str) -> str:
+    source_labels = {
+        "telegram": "Telegram-бот",
+        "vk": "VK-бот",
+        "web": "Веб-форма",
+    }
+    source_label = source_labels.get(source, source)
+    return "\n".join(
+        [
+            "🧾 Чек загружен",
+            "",
+            f"Источник: {source_label}",
+            f"ID: {player['id']}",
+            f"Позывной: {player['name']}",
+            f"Имя: {player['full_name']}",
+            f"Фракция: {player['faction']}",
+            f"Тариф: {player['tariff']}",
+            f"Загружен: {uploaded_at}",
+            f"Ссылка на чек: {receipt_link}",
+        ]
+    )
+
+
+def build_receipt_review_markup(player_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "✅ Подтвердить оплату",
+                    callback_data=f"{RECEIPT_APPROVE_CALLBACK_PREFIX}{player_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ Отклонить чек",
+                    callback_data=f"{RECEIPT_REJECT_CALLBACK_PREFIX}{player_id}",
+                )
+            ],
+        ]
+    )
+
+
+def build_receipt_review_markup_dict(player_id: str) -> dict:
+    return {
+        "inline_keyboard": [
+            [
+                {
+                    "text": "✅ Подтвердить оплату",
+                    "callback_data": f"{RECEIPT_APPROVE_CALLBACK_PREFIX}{player_id}",
+                }
+            ],
+            [
+                {
+                    "text": "❌ Отклонить чек",
+                    "callback_data": f"{RECEIPT_REJECT_CALLBACK_PREFIX}{player_id}",
+                }
+            ],
+        ]
+    }
+
+
+def build_google_credentials(config, scopes: list[str]) -> Credentials:
+    if getattr(config, "credentials_json", None):
+        credentials_info = json.loads(config.credentials_json)
+        return Credentials.from_service_account_info(credentials_info, scopes=scopes)
+    return Credentials.from_service_account_file(
+        config.credentials_file,
+        scopes=scopes,
+    )
+
+
+class DriveStorage:
+    def __init__(self, config) -> None:
+        self.config = config
+        self.service = self._build_service()
+
+    def _build_service(self):
+        scopes = ["https://www.googleapis.com/auth/drive"]
+        credentials = build_google_credentials(self.config, scopes)
+        return build("drive", "v3", credentials=credentials, cache_discovery=False)
+
+    @staticmethod
+    def make_receipt_filename(player_id: str, source: str, original_name: str) -> str:
+        sanitized_name = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).name).strip("-")
+        if not sanitized_name:
+            sanitized_name = "receipt"
+        extension = Path(sanitized_name).suffix.lower()
+        if extension not in ALLOWED_RECEIPT_EXTENSIONS:
+            extension = ".bin"
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        return f"mad-day-{source}-receipt-{player_id}-{timestamp}{extension}"
+
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        if not getattr(self.config, "drive_receipts_folder_id", None):
+            raise RuntimeError("GOOGLE_DRIVE_RECEIPTS_FOLDER_ID is not configured.")
+        file_metadata = {
+            "name": self.make_receipt_filename(player_id, source, original_name),
+        }
+        file_metadata["parents"] = [self.config.drive_receipts_folder_id]
+
+        media = MediaIoBaseUpload(io.BytesIO(content), mimetype=mime_type, resumable=False)
+        created = (
+            self.service.files()
+            .create(
+                body=file_metadata,
+                media_body=media,
+                fields="id,webViewLink,webContentLink",
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        file_id = created["id"]
+        if getattr(self.config, "receipt_public_links", False):
+            (
+                self.service.permissions()
+                .create(
+                    fileId=file_id,
+                    body={"type": "anyone", "role": "reader"},
+                    supportsAllDrives=True,
+                    fields="id",
+                )
+                .execute()
+            )
+            created = (
+                self.service.files()
+                .get(
+                    fileId=file_id,
+                    fields="id,webViewLink,webContentLink",
+                    supportsAllDrives=True,
+                )
+                .execute()
+            )
+        return {
+            "id": file_id,
+            "link": created.get("webViewLink")
+            or created.get("webContentLink")
+            or f"https://drive.google.com/file/d/{file_id}/view",
+        }
+
+
+class ReceiptStorage(Protocol):
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict: ...
+
+
+def has_cloudinary_config(config) -> bool:
+    return bool(
+        getattr(config, "cloudinary_url", None)
+        or (
+            getattr(config, "cloudinary_cloud_name", None)
+            and getattr(config, "cloudinary_api_key", None)
+            and getattr(config, "cloudinary_api_secret", None)
+        )
+    )
+
+
+class CloudinaryStorage:
+    def __init__(self, config) -> None:
+        self.config = config
+        self.folder = getattr(config, "cloudinary_receipts_folder", "mad-day-receipts")
+        config_kwargs = {"secure": True}
+        if getattr(config, "cloudinary_cloud_name", None):
+            config_kwargs["cloud_name"] = config.cloudinary_cloud_name
+            config_kwargs["api_key"] = config.cloudinary_api_key
+            config_kwargs["api_secret"] = config.cloudinary_api_secret
+        elif getattr(config, "cloudinary_url", None):
+            os.environ["CLOUDINARY_URL"] = config.cloudinary_url
+        else:
+            raise RuntimeError(
+                "Cloudinary is not configured. Set CLOUDINARY_URL or CLOUDINARY_CLOUD_NAME/CLOUDINARY_API_KEY/CLOUDINARY_API_SECRET."
+            )
+        cloudinary.config(**config_kwargs)
+
+    @staticmethod
+    def make_receipt_public_id(player_id: str, source: str, original_name: str) -> str:
+        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", Path(original_name).stem).strip("-")
+        if not stem:
+            stem = "receipt"
+        timestamp = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        random_suffix = secrets.token_hex(8)
+        return f"mad-day-{source}-receipt-{player_id}-{timestamp}-{random_suffix}-{stem}"
+
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        suffix = Path(original_name).suffix or mimetypes.guess_extension(mime_type or "") or ".bin"
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+            tmp_file.write(content)
+            temp_path = tmp_file.name
+        try:
+            result = cloudinary.uploader.upload(
+                temp_path,
+                resource_type="auto",
+                folder=self.folder,
+                public_id=self.make_receipt_public_id(player_id, source, original_name),
+                use_filename=False,
+                unique_filename=False,
+                overwrite=False,
+            )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        return {
+            "id": result.get("public_id") or "",
+            "link": result.get("secure_url") or result.get("url") or "",
+        }
+
+
+class DisabledReceiptStorage:
+    def upload_receipt(
+        self,
+        player_id: str,
+        source: str,
+        original_name: str,
+        content: bytes,
+        mime_type: str,
+    ) -> dict:
+        raise RuntimeError(
+            "Receipt storage is not configured. Set CLOUDINARY_URL or GOOGLE_DRIVE_RECEIPTS_FOLDER_ID."
+        )
+
+
+def build_receipt_storage(config) -> ReceiptStorage:
+    if has_cloudinary_config(config):
+        return CloudinaryStorage(config)
+    if getattr(config, "drive_receipts_folder_id", None):
+        return DriveStorage(config)
+    return DisabledReceiptStorage()
+
+
+def explain_receipt_upload_error(exc: Exception) -> str:
+    combined_text = str(exc).lower()
+
+    if "receipt storage is not configured" in combined_text:
+        return (
+            "Не удалось сохранить чек.\n\n"
+            "В Render ещё не настроено файловое хранилище.\n"
+            "Добавь CLOUDINARY_URL и попробуй ещё раз."
+        )
+
+    if "cloudinary is not configured" in combined_text or "must supply api_key" in combined_text:
+        return (
+            "Не удалось сохранить чек в Cloudinary.\n\n"
+            "Проверь CLOUDINARY_URL или связку CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / CLOUDINARY_API_SECRET."
+        )
+
+    if any(
+        pattern in combined_text
+        for pattern in (
+            "cloudinary_url",
+            "cloud name",
+            "cloud_name",
+            "api key",
+            "api_key",
+            "api secret",
+            "api_secret",
+            "invalid signature",
+            "unknown api key",
+            "authorization required",
+        )
+    ):
+        return (
+            "Не удалось сохранить чек в Cloudinary.\n\n"
+            "Скорее всего, неверно заполнен CLOUDINARY_URL в Render.\n"
+            "Проверь, что в Key стоит CLOUDINARY_URL, а в Value только строка вида "
+            "cloudinary://API_KEY:API_SECRET@CLOUD_NAME"
+        )
+
+    if isinstance(exc, RuntimeError) and "GOOGLE_DRIVE_RECEIPTS_FOLDER_ID" in str(exc):
+        return (
+            "Не удалось сохранить чек.\n\n"
+            "В Render ещё не задана переменная GOOGLE_DRIVE_RECEIPTS_FOLDER_ID."
+        )
+
+    if isinstance(exc, HttpError):
+        content = ""
+        if getattr(exc, "content", None):
+            try:
+                content = exc.content.decode("utf-8", errors="ignore")
+            except Exception:
+                content = str(exc.content)
+        combined = f"{exc}\n{content}".lower()
+        if "storagequotaexceeded" in combined or "service accounts do not have storage quota" in combined:
+            return (
+                "Не удалось сохранить чек в Google Drive.\n\n"
+                "Причина: сервисный аккаунт не может писать файлы в обычный My Drive.\n"
+                "Нужно использовать Shared Drive или другое файловое хранилище."
+            )
+        if "insufficient permissions" in combined or "insufficientpermission" in combined:
+            return (
+                "Не удалось сохранить чек в Google Drive.\n\n"
+                "Проверь, что папка открыта для сервисного аккаунта с правами Editor."
+            )
+
+    return (
+        "Не удалось сохранить чек.\n\n"
+        "Проверь настройки Cloudinary в Render и попробуй ещё раз."
+    )
+
+
+async def notify_admins(
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
     config = get_config(context)
     if not config.admin_ids:
         return
 
     for admin_id in sorted(config.admin_ids):
         try:
-            await context.bot.send_message(chat_id=admin_id, text=text)
+            await context.bot.send_message(chat_id=admin_id, text=text, reply_markup=reply_markup)
         except Exception as exc:
             logger.warning("Failed to send admin notification to %s: %s", admin_id, exc)
+
+
+def send_telegram_admin_notifications(
+    telegram_token: str | None,
+    admin_ids: set[int],
+    text: str,
+    reply_markup: dict | None = None,
+) -> None:
+    if not telegram_token or not admin_ids:
+        logger.info("Telegram admin notification skipped: TOKEN or ADMIN_IDS not configured.")
+        return
+
+    api_url = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+    for admin_id in sorted(admin_ids):
+        payload = {
+            "chat_id": admin_id,
+            "text": text,
+        }
+        if reply_markup:
+            payload["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+        data = urllib.parse.urlencode(payload).encode("utf-8")
+        try:
+            with urllib.request.urlopen(api_url, data=data, timeout=20) as response:
+                response.read()
+        except Exception as exc:
+            logger.warning("Failed to send admin notification to %s via raw API: %s", admin_id, exc)
+
+
+def send_vk_message_by_api(vk_token: str | None, user_id: int, text: str) -> None:
+    if not vk_token:
+        logger.info("VK player notification skipped: VK_TOKEN not configured.")
+        return
+
+    payload = {
+        "user_id": user_id,
+        "random_id": random.randint(1, 2_000_000_000),
+        "message": text,
+        "access_token": vk_token,
+        "v": "5.199",
+    }
+    data = urllib.parse.urlencode(payload).encode("utf-8")
+    with urllib.request.urlopen("https://api.vk.com/method/messages.send", data=data, timeout=20) as response:
+        response.read()
 
 
 def parse_radio_messages() -> list[str]:
@@ -749,6 +1513,90 @@ def get_config(context: ContextTypes.DEFAULT_TYPE) -> Config:
     return context.application.bot_data["config"]
 
 
+def get_receipt_storage(context: ContextTypes.DEFAULT_TYPE) -> ReceiptStorage:
+    return context.application.bot_data["receipt_storage"]
+
+
+def detect_player_source(player: dict) -> str:
+    if str(player.get("Telegram ID", "")).strip():
+        return "telegram"
+    if str(player.get("VK ID", "")).strip():
+        return "vk"
+    return "web"
+
+
+def build_player_snapshot(record: dict) -> dict:
+    return {
+        "id": str(record.get("ID", "")).strip(),
+        "name": str(record.get("Позывной", "")).strip(),
+        "full_name": str(record.get("Фамилия Имя", "")).strip(),
+        "phone": str(record.get("Телефон", "")).strip(),
+        "faction": str(record.get("Фракция", "")).strip(),
+        "tariff": str(record.get("Тариф", "")).strip(),
+    }
+
+
+def is_supported_receipt_file(filename: str, mime_type: str | None) -> bool:
+    extension = Path(filename).suffix.lower()
+    if extension in ALLOWED_RECEIPT_EXTENSIONS:
+        return True
+    if mime_type:
+        lowered = mime_type.lower()
+        return lowered == "application/pdf" or lowered.startswith("image/")
+    return False
+
+
+async def extract_telegram_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[bytes, str, str]:
+    if update.message.document:
+        document = update.message.document
+        filename = document.file_name or f"receipt-{document.file_unique_id}"
+        mime_type = document.mime_type or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        if not is_supported_receipt_file(filename, mime_type):
+            raise ValueError("Пришли PDF, JPG или PNG файл.")
+        if document.file_size and document.file_size > MAX_RECEIPT_FILE_SIZE:
+            raise ValueError("Файл слишком большой. Максимум 10 МБ.")
+        file = await context.bot.get_file(document.file_id)
+        data = bytes(await file.download_as_bytearray())
+        return data, filename, mime_type
+
+    if update.message.photo:
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        data = bytes(await file.download_as_bytearray())
+        if len(data) > MAX_RECEIPT_FILE_SIZE:
+            raise ValueError("Файл слишком большой. Максимум 10 МБ.")
+        return data, f"receipt-{photo.file_unique_id}.jpg", "image/jpeg"
+
+    raise ValueError("Пришли PDF, JPG или PNG файл.")
+
+
+async def notify_player_about_payment_review(
+    context: ContextTypes.DEFAULT_TYPE,
+    player: dict,
+    approved: bool,
+) -> None:
+    config = get_config(context)
+    text = (
+        "✅ Оплата подтверждена.\n\nТвой статус в реестре MAD DAY обновлён."
+        if approved
+        else "❌ Чек отклонён.\n\nОткрой /payment и пришли новый PDF или скрин."
+    )
+
+    telegram_id = str(player.get("Telegram ID", "")).strip()
+    vk_id = str(player.get("VK ID", "")).strip()
+
+    try:
+        if telegram_id.isdigit():
+            await context.bot.send_message(chat_id=int(telegram_id), text=text, reply_markup=build_main_menu())
+            return
+        if vk_id.isdigit():
+            await asyncio.to_thread(send_vk_message_by_api, config.vk_token, int(vk_id), text)
+            return
+        logger.info("No direct channel to notify player %s about payment review.", player.get("ID", ""))
+    except Exception as exc:
+        logger.warning("Failed to notify player %s about payment review: %s", player.get("ID", ""), exc)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if not context.application.bot_data.get("registration_open", True):
         await update.message.reply_text("Регистрация сейчас закрыта.")
@@ -775,6 +1623,18 @@ async def begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE)
         reply_markup=ReplyKeyboardRemove(),
     )
     return CALLSIGN
+
+
+async def force_begin_registration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.application.bot_data.get("registration_open", True):
+        await update.message.reply_text("Регистрация сейчас закрыта.", reply_markup=build_main_menu())
+        return
+
+    context.user_data.clear()
+    await update.message.reply_text(
+        "Введи позывной бойца:",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -912,10 +1772,14 @@ async def get_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "phone": context.user_data["phone"],
         "faction": context.user_data["faction"],
         "tariff": tariff,
-        "chat_id": str(update.effective_chat.id),
+        "telegram_id": str(update.effective_chat.id),
         "date": datetime.now(timezone).strftime("%d.%m.%Y %H:%M"),
-        "payment_status": "не оплачено",
+        "payment_status": PAYMENT_STATUS_PENDING,
         "payment_date": "",
+        "receipt_link": "",
+        "receipt_uploaded_at": "",
+        "payment_reviewer": "",
+        "payment_comment": "",
     }
 
     await asyncio.to_thread(sheet.append_player, player)
@@ -1081,7 +1945,7 @@ async def scenario3(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet = get_sheet(context)
     config = get_config(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
 
     if not player:
         await update.message.reply_text(
@@ -1113,7 +1977,7 @@ async def briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def faction_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet = get_sheet(context)
     config = get_config(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
 
     if not player:
         await update.message.reply_text(
@@ -1166,7 +2030,7 @@ async def countdown(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     sheet = get_sheet(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, update.effective_chat.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
 
     if not player:
         await update.message.reply_text(
@@ -1197,12 +2061,80 @@ async def radio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(random.choice(messages), reply_markup=build_main_menu())
 
 
+async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("OK", reply_markup=build_main_menu())
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not user:
+        await update.message.reply_text("Не удалось определить пользователя.")
+        return
+    await update.message.reply_text(f"Твой Telegram ID: {user.id}", reply_markup=build_main_menu())
+
+
+async def request_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sheet = get_sheet(context)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
+    if not player:
+        await update.message.reply_text(
+            "Сначала зарегистрируйся, а потом уже можно будет перерегистрироваться.",
+            reply_markup=build_main_menu(),
+        )
+        return
+    await update.message.reply_text(
+        "♻ Перерегистрация удалит твою текущую запись и запустит регистрацию заново.\n\nПодтвердить?",
+        reply_markup=build_reregister_confirmation_menu(),
+    )
+
+
+async def confirm_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    sheet = get_sheet(context)
+    removed = await asyncio.to_thread(
+        sheet.delete_player_by_platform_id,
+        "telegram",
+        update.effective_chat.id,
+    )
+    context.user_data.clear()
+    if not removed:
+        await update.message.reply_text(
+            "Текущая запись не найдена. Начинаем обычную регистрацию.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    else:
+        await update.message.reply_text(
+            "♻ Старая регистрация удалена. Начинаем заново.",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+    return await start(update, context)
+
+
+async def cancel_reregister(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Перерегистрация отменена.",
+        reply_markup=build_main_menu(),
+    )
+
+
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = load_text_content(
         "info",
-        "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 5.0",
+        "ℹ ИНФОРМАЦИЯ ОБ ИГРЕ\n\nMAD DAY 6.0",
     )
     await update.message.reply_text(text, reply_markup=build_main_menu())
+
+
+async def payment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    sheet = get_sheet(context)
+    config = get_config(context)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
+    if not player:
+        await update.message.reply_text(
+            "Сначала зарегистрируйся через /start, а потом открой оплату.",
+            reply_markup=build_main_menu(),
+        )
+        return
+    await send_payment_info(update.message, config)
 
 
 async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1211,7 +2143,7 @@ async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     sheet = get_sheet(context)
     config = get_config(context)
-    player = await asyncio.to_thread(sheet.player_by_chat_id, query.from_user.id)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, query.from_user.id)
     if not player:
         await query.message.reply_text(
             "Сначала зарегистрируйся через /start, затем подтверди оплату.",
@@ -1219,46 +2151,164 @@ async def payment_confirmed(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         )
         return
 
-    if str(player.get("Оплата", "")).strip().lower() == "оплачено":
+    payment_status = str(player.get("Оплата", "")).strip().lower()
+    if payment_status == PAYMENT_STATUS_PAID:
         await query.message.reply_text(
             "Оплата уже отмечена. Увидимся на полигоне.",
             reply_markup=build_main_menu(),
         )
         return
 
-    paid_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
-    updated = await asyncio.to_thread(sheet.mark_paid, query.from_user.id, paid_at)
-    if not updated:
-        await query.message.reply_text(
-            "Не удалось обновить оплату в реестре. Попробуй ещё раз позже.",
+    context.user_data[RECEIPT_UPLOAD_PENDING_KEY] = True
+    prompt = (
+        "Пришли PDF, JPG или PNG чека одним сообщением.\n\n"
+        "После проверки организатор подтвердит оплату вручную."
+    )
+    if payment_status == PAYMENT_STATUS_RECEIPT_UPLOADED:
+        prompt = (
+            "Чек уже загружен, но ты можешь заменить его.\n\n"
+            "Пришли новый PDF, JPG или PNG одним сообщением."
+        )
+    await query.message.reply_text(
+        prompt,
+        reply_markup=build_main_menu(),
+    )
+
+
+async def handle_receipt_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.user_data.get(RECEIPT_UPLOAD_PENDING_KEY):
+        return
+
+    sheet = get_sheet(context)
+    storage = get_receipt_storage(context)
+    config = get_config(context)
+    player = await asyncio.to_thread(sheet.player_by_telegram_id, update.effective_chat.id)
+    if not player:
+        context.user_data.pop(RECEIPT_UPLOAD_PENDING_KEY, None)
+        await update.message.reply_text(
+            "Сначала зарегистрируйся через /start, а потом загружай чек.",
             reply_markup=build_main_menu(),
         )
         return
 
-    await query.message.reply_text(
-        "✅ Оплата отмечена.\n\n"
-        "Статус бойца обновлён в реестре MAD DAY.",
-        reply_markup=build_main_menu(),
-    )
+    try:
+        content, filename, mime_type = await extract_telegram_receipt(update, context)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc), reply_markup=build_main_menu())
+        return
+
+    uploaded_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
+    player_id = str(player.get("ID", "")).strip()
+    try:
+        upload_result = await asyncio.to_thread(
+            storage.upload_receipt,
+            player_id,
+            "telegram",
+            filename,
+            content,
+            mime_type,
+        )
+        await asyncio.to_thread(
+            sheet.record_receipt_upload,
+            player_id,
+            upload_result["link"],
+            uploaded_at,
+        )
+    except Exception as exc:
+        logger.exception("Failed to upload Telegram receipt for player_id=%s: %s", player_id, exc)
+        await update.message.reply_text(
+            explain_receipt_upload_error(exc),
+            reply_markup=build_main_menu(),
+        )
+        return
+    context.user_data.pop(RECEIPT_UPLOAD_PENDING_KEY, None)
+    refreshed_player = await asyncio.to_thread(sheet.player_by_id, player_id) or player
+
     await notify_admins(
         context,
-        format_admin_payment_notice(
-            {
-                "id": str(player.get("ID", "")).strip(),
-                "name": str(player.get("Позывной", "")).strip(),
-                "full_name": str(player.get("Фамилия Имя", "")).strip(),
-                "phone": str(player.get("Телефон", "")).strip(),
-                "faction": str(player.get("Фракция", "")).strip(),
-                "tariff": str(player.get("Тариф", "")).strip(),
-            },
-            "telegram",
-            paid_at,
+        format_admin_receipt_notice(
+            build_player_snapshot(refreshed_player),
+            detect_player_source(refreshed_player),
+            uploaded_at,
+            upload_result["link"],
         ),
+        reply_markup=build_receipt_review_markup(player_id),
     )
+    await update.message.reply_text(
+        "🧾 Чек загружен.\n\nОрганизатор проверит оплату и подтвердит её вручную.",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def review_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE, approved: bool) -> None:
+    query = update.callback_query
+    if not is_admin(update, context):
+        await query.answer("Только организатор может проверять чеки.", show_alert=True)
+        return
+    await query.answer()
+
+    callback_prefix = RECEIPT_APPROVE_CALLBACK_PREFIX if approved else RECEIPT_REJECT_CALLBACK_PREFIX
+    player_id = query.data.removeprefix(callback_prefix)
+    sheet = get_sheet(context)
+    config = get_config(context)
+    player = await asyncio.to_thread(sheet.player_by_id, player_id)
+    if not player:
+        await query.edit_message_text("Запись игрока не найдена.")
+        return
+
+    current_status = str(player.get("Оплата", "")).strip().lower()
+    if approved and current_status == PAYMENT_STATUS_PAID:
+        await query.answer("Оплата уже подтверждена.")
+        return
+    if not approved and current_status == PAYMENT_STATUS_REJECTED:
+        await query.answer("Чек уже отклонён.")
+        return
+
+    reviewed_at = datetime.now(ZoneInfo(config.timezone_name)).strftime("%d.%m.%Y %H:%M")
+    reviewer = query.from_user.full_name if query.from_user else "Организатор"
+    comment = "Подтверждено организатором" if approved else "Нужен новый чек"
+    updated = await asyncio.to_thread(
+        sheet.review_payment,
+        player_id,
+        approved,
+        reviewed_at,
+        reviewer,
+        comment,
+    )
+    if not updated:
+        await query.edit_message_text("Не удалось обновить статус оплаты.")
+        return
+
+    refreshed_player = await asyncio.to_thread(sheet.player_by_id, player_id) or player
+    await notify_player_about_payment_review(context, refreshed_player, approved)
+    status_line = "✅ Оплата подтверждена" if approved else "❌ Чек отклонён"
+    reviewed_text = "\n".join(
+        [
+            format_admin_receipt_notice(
+                build_player_snapshot(refreshed_player),
+                detect_player_source(refreshed_player),
+                str(refreshed_player.get("Дата загрузки чека", "")).strip(),
+                str(refreshed_player.get("Ссылка на чек", "")).strip(),
+            ),
+            "",
+            status_line,
+            f"Проверил: {reviewer}",
+            f"Время: {reviewed_at}",
+        ]
+    )
+    await query.edit_message_text(reviewed_text)
 
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await send_main_menu(update.message)
+
+
+async def approve_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await review_receipt(update, context, approved=True)
+
+
+async def reject_receipt(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await review_receipt(update, context, approved=False)
 
 
 async def players(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1292,7 +2342,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sheet = get_sheet(context)
-    chat_ids = await asyncio.to_thread(sheet.registered_chat_ids)
+    chat_ids = await asyncio.to_thread(sheet.registered_telegram_ids)
     success_count = 0
 
     for chat_id in chat_ids:
@@ -1304,6 +2354,137 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     await update.message.reply_text(
         f"Рассылка завершена. Доставлено: {success_count}",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def broadcast_unpaid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+
+    message = " ".join(context.args).strip()
+    if not message:
+        await update.message.reply_text(
+            "Использование: /broadcast_unpaid текст сообщения",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    sheet = get_sheet(context)
+    chat_ids = await asyncio.to_thread(sheet.unpaid_telegram_ids)
+    success_count = 0
+
+    for chat_id in chat_ids:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=message)
+            success_count += 1
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            logger.warning("Broadcast to unpaid failed for chat_id=%s: %s", chat_id, exc)
+
+    await update.message.reply_text(
+        f"Рассылка неоплатившим завершена. Доставлено: {success_count}",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def sendtg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /sendtg TELEGRAM_ID текст сообщения",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    telegram_id_raw = context.args[0].strip()
+    if not telegram_id_raw.isdigit():
+        await update.message.reply_text(
+            "TELEGRAM_ID должен быть числом.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    message = " ".join(context.args[1:]).strip()
+    if not message:
+        await update.message.reply_text(
+            "После TELEGRAM_ID укажи текст сообщения.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    try:
+        await context.bot.send_message(chat_id=int(telegram_id_raw), text=message)
+    except Exception as exc:
+        logger.warning("Direct sendtg failed for chat_id=%s: %s", telegram_id_raw, exc)
+        await update.message.reply_text(
+            f"Не удалось отправить сообщение на Telegram ID {telegram_id_raw}.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    await update.message.reply_text(
+        f"Сообщение отправлено на Telegram ID {telegram_id_raw}.",
+        reply_markup=build_main_menu(),
+    )
+
+
+async def sendplayer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_admin(update, context):
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /sendplayer ID_ИГРОКА текст сообщения",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    player_id = context.args[0].strip()
+    message = " ".join(context.args[1:]).strip()
+    if not message:
+        await update.message.reply_text(
+            "После ID игрока укажи текст сообщения.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    sheet = get_sheet(context)
+    player = await asyncio.to_thread(sheet.player_by_id, player_id)
+    if not player:
+        await update.message.reply_text(
+            f"Игрок с ID {player_id} не найден.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    telegram_id = str(player.get("Telegram ID", "")).strip()
+    if not telegram_id.isdigit():
+        await update.message.reply_text(
+            f"У игрока {player_id} не заполнен Telegram ID.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    try:
+        await context.bot.send_message(chat_id=int(telegram_id), text=message)
+    except Exception as exc:
+        logger.warning(
+            "Direct sendplayer failed for player_id=%s telegram_id=%s: %s",
+            player_id,
+            telegram_id,
+            exc,
+        )
+        await update.message.reply_text(
+            f"Не удалось отправить сообщение игроку {player_id}.",
+            reply_markup=build_main_menu(),
+        )
+        return
+
+    await update.message.reply_text(
+        f"Сообщение отправлено игроку {player_id} ({telegram_id}).",
         reply_markup=build_main_menu(),
     )
 
@@ -1359,10 +2540,13 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start - начать регистрацию\n"
         "/menu - открыть терминал\n"
         "/me - мой паспорт бойца\n"
+        "/ping - проверка бота\n"
+        "/myid - показать Telegram ID\n"
         "/stats - баланс фракций\n"
         "/lore - лор мира\n"
         "/map - карта полигона\n"
         "/schedule - расписание игры\n"
+        "/payment - оплата и загрузка чека\n"
         "/radio - радио пустоши\n"
         "/info - информация об игре\n"
         "/briefing - брифинг фракции\n"
@@ -1374,6 +2558,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "\nОрганизатор:\n"
         "/players\n"
         "/broadcast текст\n"
+        "/broadcast_unpaid текст\n"
+        "/sendtg TELEGRAM_ID текст\n"
+        "/sendplayer ID_ИГРОКА текст\n"
         "/export\n"
         "/close_registration\n"
         "/open_registration",
@@ -1392,7 +2579,7 @@ async def run_game_reminder(
 ) -> None:
     await asyncio.sleep(delay_seconds)
     sheet: RegistrationSheet = application.bot_data["sheet"]
-    chat_ids = await asyncio.to_thread(sheet.registered_chat_ids)
+    chat_ids = await asyncio.to_thread(sheet.registered_telegram_ids)
 
     if not chat_ids:
         logger.info("Reminder %s skipped: no registered chat IDs found.", reminder_label)
@@ -1469,6 +2656,7 @@ async def post_shutdown(application: Application) -> None:
 
 def build_application(config: Config) -> Application:
     sheet = RegistrationSheet(config)
+    receipt_storage = build_receipt_storage(config)
     application = (
         Application.builder()
         .token(config.token)
@@ -1478,6 +2666,7 @@ def build_application(config: Config) -> Application:
     )
     application.bot_data["config"] = config
     application.bot_data["sheet"] = sheet
+    application.bot_data["receipt_storage"] = receipt_storage
     application.bot_data["registration_open"] = True
 
     registration = ConversationHandler(
@@ -1504,9 +2693,18 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("lore", lore))
     application.add_handler(CommandHandler("map", send_map))
     application.add_handler(CommandHandler("schedule", schedule))
+    application.add_handler(CommandHandler("payment", payment))
     application.add_handler(CommandHandler("radio", radio))
+    application.add_handler(CommandHandler("ping", ping))
+    application.add_handler(CommandHandler("myid", myid))
     application.add_handler(CommandHandler("info", info))
     application.add_handler(CallbackQueryHandler(payment_confirmed, pattern=f"^{PAYMENT_CONFIRMED_CALLBACK}$"))
+    application.add_handler(
+        CallbackQueryHandler(approve_receipt, pattern=f"^{RECEIPT_APPROVE_CALLBACK_PREFIX}")
+    )
+    application.add_handler(
+        CallbackQueryHandler(reject_receipt, pattern=f"^{RECEIPT_REJECT_CALLBACK_PREFIX}")
+    )
     application.add_handler(CommandHandler("briefing", briefing))
     application.add_handler(CommandHandler("scenario1", scenario1))
     application.add_handler(CommandHandler("scenario2", scenario2))
@@ -1514,11 +2712,20 @@ def build_application(config: Config) -> Application:
     application.add_handler(CommandHandler("countdown", countdown))
     application.add_handler(CommandHandler("players", players))
     application.add_handler(CommandHandler("broadcast", broadcast))
+    application.add_handler(CommandHandler("broadcast_unpaid", broadcast_unpaid))
+    application.add_handler(CommandHandler("sendtg", sendtg))
+    application.add_handler(CommandHandler("sendplayer", sendplayer))
     application.add_handler(CommandHandler("export", export_players))
     application.add_handler(CommandHandler("close_registration", close_registration))
     application.add_handler(CommandHandler("open_registration", open_registration))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(
+        MessageHandler(
+            filters.Document.ALL | filters.PHOTO,
+            handle_receipt_upload,
+        )
+    )
     application.add_handler(
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -1532,8 +2739,16 @@ async def handle_menu_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE
     text = update.message.text.strip()
     if text == MENU_PROFILE:
         await me(update, context)
+    elif text == START_REGISTRATION_BUTTON:
+        await force_begin_registration(update, context)
     elif text == MENU_REGISTER:
         await start(update, context)
+    elif text == MENU_REREGISTER:
+        await request_reregister(update, context)
+    elif text == REREGISTER_CONFIRM_BUTTON:
+        await confirm_reregister(update, context)
+    elif text == REREGISTER_CANCEL_BUTTON:
+        await cancel_reregister(update, context)
     elif text == MENU_MAP:
         await send_map(update, context)
     elif text == MENU_SCHEDULE:
