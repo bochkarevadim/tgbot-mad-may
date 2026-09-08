@@ -172,6 +172,10 @@ def _image_data_uri_from_path(path: Path) -> str | None:
     return f"data:{mime};base64,{payload}"
 
 
+def _banner_data_uri() -> str | None:
+    return _image_data_uri_from_path(BASE_DIR / "content" / "banner.jpg")
+
+
 def _collect_map_images() -> list[tuple[str, str]]:
     images: list[tuple[str, str]] = []
     for title, path in [
@@ -214,6 +218,13 @@ def _render_layout(title: str, body: str) -> str:
           }}
           h1, h2, h3 {{
             margin-top: 0;
+          }}
+          .banner {{
+            display: block;
+            width: 100%;
+            height: auto;
+            border-radius: 14px;
+            margin-bottom: 20px;
           }}
           .grid {{
             display: grid;
@@ -390,9 +401,12 @@ def _render_register_page(
         tariff_options.append(f'<option value="{_escape(tariff)}" {selected}>{_escape(tariff)}</option>')
 
     notice_block = f'<div class="success">{_escape(notice)}</div>' if notice else ""
+    banner_uri = _banner_data_uri()
+    banner_block = f'<img class="banner" src="{banner_uri}" alt="MAD DAY 6.0">' if banner_uri else ""
     return _render_layout(
         "MAD DAY — регистрация и чек",
         f"""
+        {banner_block}
         <h1>MAD DAY 6.0</h1>
         <p class="muted">Регистрация игрока и загрузка чека оплаты в одном терминале.</p>
         {notice_block}
